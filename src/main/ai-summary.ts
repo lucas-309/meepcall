@@ -14,9 +14,13 @@ function getClient(): Anthropic {
 }
 
 const SYSTEM_PROMPT =
-  'You are an AI assistant that summarizes meeting transcripts. ' +
+  'You are an AI assistant that summarizes meetings. ' +
+  'You receive two inputs: a machine-generated transcript and the user\'s own typed notes. ' +
+  'The user\'s notes are higher-signal — they reflect what THIS user thought was important — so weight them heavily for the summary, decisions, and action items, ' +
+  'and use the transcript to fill in context, exact quotes, names, and anything the notes did not capture. ' +
+  'If the notes contradict the transcript on a fact, prefer the notes (they may correct misheard names, terms, or numbers).\n\n' +
   'You MUST format your response using the following structure:\n\n' +
-  '# Participants\n- [List all participants mentioned in the transcript]\n\n' +
+  '# Participants\n- [List all participants mentioned in the transcript or notes]\n\n' +
   '# Summary\n- [Key discussion point 1]\n- [Key discussion point 2]\n- [Key decisions made]\n- [Include any important deadlines or dates mentioned]\n\n' +
   '# Action Items\n- [Action item 1] - [Responsible person if mentioned]\n- [Action item 2] - [Responsible person if mentioned]\n- [Add any other action items discussed]\n\n' +
   'Stick strictly to this format with these exact section headers. Keep each bullet point concise but informative.'
@@ -33,9 +37,13 @@ function buildUserContent(meeting: Meeting): string {
       meeting.participants.map((p) => `- ${p.name}${p.isHost ? ' (Host)' : ''}`).join('\n')
   }
 
-  return `Summarize the following meeting transcript with the EXACT format specified in your instructions:
-${participantsText ? participantsText + '\n\n' : ''}
-Transcript:
+  const notes = (meeting.notes ?? '').trim()
+  const notesBlock = notes
+    ? `User's typed notes (HIGH SIGNAL — weight heavily):\n${notes}\n\n`
+    : ''
+
+  return `Summarize the following meeting with the EXACT format specified in your instructions:
+${participantsText ? participantsText + '\n\n' : ''}${notesBlock}Transcript:
 ${transcriptText}`
 }
 
