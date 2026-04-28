@@ -32,6 +32,21 @@ const LANGUAGE = process.env.WHISPER_LANGUAGE?.trim() || 'auto'
 const HALLUCINATION_RE =
   /^\s*(thank you[.!]?|thanks for watching[.!]?|you|\[.*\]|\(.*\))\s*$/i
 
+// Decoder repetition loop: one character repeated 7+ times in a row.
+// Catches වවවවවව, "eeeeeee", "..............", etc.
+const CHAR_LOOP_RE = /(.)\1{6,}/
+
+// Decoder token-loop: a short token (1–4 chars) repeated 4+ times separated
+// by whitespace. Catches "ʔ ʔ ʔ ʔ", "the the the the the".
+const TOKEN_LOOP_RE = /(\S{1,4})(\s+\1){3,}/
+
+function isHallucination(text: string): boolean {
+  if (HALLUCINATION_RE.test(text)) return true
+  if (CHAR_LOOP_RE.test(text)) return true
+  if (TOKEN_LOOP_RE.test(text)) return true
+  return false
+}
+
 interface WhisperJSON {
   transcription?: Array<{
     text?: string
@@ -121,7 +136,7 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
 
     const entries: TranscriptEntry[] = []
     for (const seg of segs) {
-      if (HALLUCINATION_RE.test(seg.text)) continue
+      if (isHallucination(seg.text)) continue
       if (seg.text === lastEntry[source]) continue
       lastEntry[source] = seg.text
       entries.push({
