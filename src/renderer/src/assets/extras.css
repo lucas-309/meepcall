@@ -237,13 +237,43 @@
 
 .transcript-body {
   padding: 12px 16px;
-  max-height: 320px;
+  max-height: 180px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 8px;
   /* Subtle inner background for the scrolling area */
   background-color: #fcfcfc;
+}
+
+/* ===================== Notes editor card ===================== */
+.notes-card .card-body {
+  padding: 0;
+}
+
+.notes-textarea {
+  width: 100%;
+  min-height: 200px;
+  padding: 14px 16px;
+  border: none;
+  border-radius: 0 0 8px 8px;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background-color: #fcfcfc;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.notes-textarea::placeholder {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.notes-textarea:focus {
+  background-color: #ffffff;
 }
 
 .transcript-card .transcript-entry {

@@ -104,6 +104,8 @@ export function NoteEditor({ meetingId }: Props): JSX.Element {
           onTitleKeyDown={handleTitleKeyDown}
         />
 
+        <NotesEditor meeting={meeting} />
+
         <LiveTranscript meeting={meeting} isRecording={isRecording} />
 
         <AISummary
@@ -169,6 +171,66 @@ function NoteHeader({
         {meeting.recordingComplete && <span className="note-author done">Recorded</span>}
       </div>
     </div>
+  )
+}
+
+function NotesEditor({ meeting }: { meeting: Meeting }): JSX.Element {
+  const { updateMeeting } = useMeetings()
+  const [draft, setDraft] = useState<string>(meeting.notes ?? '')
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const draftRef = useRef<string>(draft)
+  draftRef.current = draft
+
+  // Reset draft only when switching meetings — not on every prop refresh from
+  // transcript reloads, or live typing would get clobbered.
+  useEffect(() => {
+    setDraft(meeting.notes ?? '')
+  }, [meeting.id])
+
+  const flush = (): void => {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current)
+      debounceRef.current = null
+    }
+    void updateMeeting(meeting.id, { notes: draftRef.current })
+  }
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current)
+        void updateMeeting(meeting.id, { notes: draftRef.current })
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>): void => {
+    const value = e.target.value
+    setDraft(value)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => {
+      void updateMeeting(meeting.id, { notes: value })
+      debounceRef.current = null
+    }, 400)
+  }
+
+  return (
+    <section className="card notes-card">
+      <div className="card-header">
+        <h3>Notes</h3>
+      </div>
+      <div className="card-body">
+        <textarea
+          className="notes-textarea"
+          value={draft}
+          onChange={handleChange}
+          onBlur={flush}
+          placeholder="Type your notes here. They'll be combined with the transcript when AI summarizes."
+          spellCheck
+        />
+      </div>
+    </section>
   )
 }
 
