@@ -27,6 +27,7 @@ export interface Meeting {
   recordingId?: string
   platform?: string
   transcript?: TranscriptEntry[]
+  notes?: string
   hasSummary?: boolean
   recordingComplete?: boolean
   recordingEndTime?: string
