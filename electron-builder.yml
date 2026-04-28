@@ -1,0 +1,32 @@
+appId: ai.recall.recall
+productName: Recall
+directories:
+  buildResources: build
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+asarUnpack:
+  - resources/**
+  - node_modules/@recallai/**
+mac:
+  target:
+    - dmg
+  category: public.app-category.productivity
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  extendInfo:
+    NSCameraUsageDescription: Recall needs camera access to record participant video.
+    NSMicrophoneUsageDescription: Recall needs microphone access to record meeting audio.
+    NSScreenCaptureUsageDescription: Recall needs screen recording access to capture meetings.
+    NSAccessibilityUsageDescription: Recall uses accessibility access to detect meetings.
+    NSUserNotificationAlertStyle: alert
+dmg:
+  artifactName: ${name}-${version}.${ext}
+afterPack: build/afterPack.js
+npmRebuild: false
