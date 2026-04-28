@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "recall-docs": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.inkeep.com/recallai/mcp"
+      ],
+      "env": {}
+    }
+  }
+}
