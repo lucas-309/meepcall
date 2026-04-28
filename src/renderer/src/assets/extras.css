@@ -1,0 +1,355 @@
+/* ===================== Detected-meeting banner (home) ===================== */
+.detected-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 24px;
+  padding: 12px 16px;
+  background-color: #fff8df;
+  border: 1px solid #ffe28a;
+  border-radius: 8px;
+  color: #5a4500;
+  font-size: 14px;
+}
+
+.detected-banner strong {
+  color: #3a2a00;
+}
+
+.detected-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff3b30;
+  flex-shrink: 0;
+  animation: pulse-dot 1.5s infinite;
+}
+
+.detected-dot.blue {
+  background: #007aff;
+  animation: pulse-blue 1.8s infinite;
+}
+
+@keyframes pulse-blue {
+  0% {
+    box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(0, 122, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(0, 122, 255, 0);
+  }
+}
+
+.detected-banner.comm {
+  background-color: #eaf3ff;
+  border-color: #b3d4ff;
+  color: #004080;
+}
+
+.detected-banner.comm strong {
+  color: #002a55;
+}
+
+/* Highlighted "Record X" button when a comm app is detected */
+.btn.new-note-btn.highlighted {
+  background-color: #eaf3ff;
+  border-color: #007aff;
+  color: #004080;
+  font-weight: 600;
+}
+
+.btn.new-note-btn.highlighted:hover {
+  background-color: #d6e8ff;
+}
+
+@keyframes pulse-dot {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(255, 59, 48, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 59, 48, 0);
+  }
+}
+
+/* ===================== Empty state on home ===================== */
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-secondary);
+  max-width: 480px;
+  margin: 60px auto 0;
+}
+
+.empty-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.empty-state p {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ===================== Date-grouped sections on home ===================== */
+.meetings-section + .meetings-section {
+  margin-top: 30px;
+}
+
+.meetings-section .section-title {
+  margin-top: 0;
+}
+
+/* ===================== Editor — content layout ===================== */
+
+/* Override Muesli's tight 100vh-250px height since we no longer use a textarea */
+.note-container {
+  height: auto;
+  min-height: calc(100vh - 60px);
+  display: block;
+  padding-bottom: 100px;
+}
+
+.editor-content {
+  padding: 28px 40px 80px;
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+.note-header {
+  margin-bottom: 24px;
+}
+
+#noteTitle {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  margin: 0;
+}
+
+.note-meta .note-author {
+  background-color: #f2f2f2;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.note-meta .note-author.done {
+  background-color: #e8f5e9;
+  color: #2e7d32;
+}
+
+/* ===================== Cards (Transcript + AI Summary) ===================== */
+.card {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  margin-bottom: 20px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  background-color: #fafafa;
+}
+
+.card-header h3 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin: 0;
+}
+
+.card-count {
+  background: #ececec;
+  color: var(--text-secondary);
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.card-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.card-badge.streaming {
+  background-color: #fff7e0;
+  color: #8a5a00;
+}
+
+.card-action {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.card-action:hover:not(:disabled) {
+  background-color: #f5f5f5;
+  color: var(--text-primary);
+}
+
+.card-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.card-body {
+  padding: 16px;
+}
+
+.card-placeholder {
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-style: italic;
+  padding: 20px 4px;
+  text-align: center;
+}
+
+/* ===================== Live Transcript card ===================== */
+.transcript-card .card-header {
+  /* push the count to the far right */
+}
+
+.transcript-body {
+  padding: 12px 16px;
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Subtle inner background for the scrolling area */
+  background-color: #fcfcfc;
+}
+
+.transcript-card .transcript-entry {
+  background-color: white;
+  border-left: 3px solid #d8d8d8;
+  border-radius: 4px;
+  padding: 8px 12px;
+}
+
+.transcript-card .transcript-entry.newest-entry {
+  border-left-color: #007aff;
+  background-color: #f0f7ff;
+}
+
+.transcript-card .transcript-speaker {
+  font-size: 11px;
+  font-weight: 600;
+  color: #007aff;
+  margin-bottom: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.transcript-card .transcript-text {
+  font-size: 14px;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+/* ===================== AI Summary card ===================== */
+.summary-content {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.summary-content h1 {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0 0 12px;
+}
+
+.summary-content h2 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 18px 0 8px;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 6px;
+}
+
+.summary-content h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 14px 0 6px;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text-primary);
+}
+
+.summary-content ul,
+.summary-content ol {
+  margin: 0 0 12px 20px;
+  padding: 0;
+}
+
+.summary-content li {
+  margin-bottom: 4px;
+}
+
+.summary-content p {
+  margin: 0 0 12px;
+}
+
+.summary-content code {
+  background-color: #f2f2f2;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+}
+
+.summary-cta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  font-style: normal;
+}
+
+.summary-cta p {
+  margin: 0;
+}
+
+/* ===================== Primary button ===================== */
+.btn.primary {
+  background-color: #007aff;
+  color: white;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 6px;
+  font-weight: 500;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn.primary:hover {
+  background-color: #0066d4;
+}
