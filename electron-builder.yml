@@ -17,8 +17,8 @@ extraResources:
     to: bin/audio-helper
   - from: build/bin/whisper-cli
     to: bin/whisper-cli
-  - from: build/models/ggml-small.bin
-    to: models/ggml-small.bin
+  - from: build/models/ggml-medium.bin
+    to: models/ggml-medium.bin
 mac:
   target:
     - dmg

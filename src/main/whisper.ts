@@ -18,10 +18,11 @@ export interface WhisperSession {
   destroy(): void
 }
 
-// Default to the multilingual `small` model (~466 MB). Override via env var:
-//   WHISPER_MODEL=ggml-base.en.bin (English-only, smaller, faster, ~5% worse)
-//   WHISPER_MODEL=ggml-medium.bin  (multilingual, larger, slower, better)
-const MODEL_NAME = process.env.WHISPER_MODEL?.trim() || 'ggml-small.bin'
+// Default to the multilingual `medium` model (~1.5 GB). Override via env var:
+//   WHISPER_MODEL=ggml-small.bin   (multilingual, smaller/faster, more hallucinations)
+//   WHISPER_MODEL=ggml-base.en.bin (English-only, smallest, fastest)
+//   WHISPER_MODEL=ggml-large-v3.bin (multilingual, ~3 GB, best quality, slowest)
+const MODEL_NAME = process.env.WHISPER_MODEL?.trim() || 'ggml-medium.bin'
 // `auto` lets whisper detect the language per chunk. Override via env var:
 //   WHISPER_LANGUAGE=en (force English, skip auto-detect)
 //   WHISPER_LANGUAGE=es / zh / ja / ko / fr / etc. (force specific)

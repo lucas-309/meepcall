@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Fetch whisper.cpp assets (binary + model) into build/.
 # - whisper-cli: built from source at the pinned tag
-# - ggml-small.bin: downloaded from huggingface (multilingual, ~466 MB)
+# - ggml-medium.bin: downloaded from huggingface (multilingual, ~1.5 GB)
 #
 # Idempotent: skips work if files already exist and are non-empty.
 # Set FORCE=1 to redo everything.
-# Override the model with WHISPER_MODEL_NAME=ggml-base.en.bin (or any other
+# Override the model with WHISPER_MODEL_NAME=ggml-small.bin (or any other
 # whisper.cpp model name). The same name must also be passed to the app at
 # runtime via WHISPER_MODEL (see src/main/whisper.ts).
 
 set -euo pipefail
 
 WHISPER_TAG="${WHISPER_TAG:-v1.7.4}"
-MODEL_NAME="${WHISPER_MODEL_NAME:-ggml-small.bin}"
+MODEL_NAME="${WHISPER_MODEL_NAME:-ggml-medium.bin}"
 MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${MODEL_NAME}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

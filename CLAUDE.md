@@ -37,7 +37,7 @@ only — every other platform is intentionally out of scope.
    recordings (the ⌘⇧R / Record Audio / comm-app paths), a local Swift sidecar
    (`build/bin/audio-helper`) emits 16 kHz mono Int16 PCM, Node chunks every
    5 s, and `build/bin/whisper-cli` (whisper.cpp) transcribes locally with
-   `ggml-base.en.bin`. The mic and system audio are captured as **separate**
+   `ggml-medium.bin`. The mic and system audio are captured as **separate**
    helper processes so we can label them `"You"` and `"Other"` respectively
    (whisper itself doesn't diarize).
 
@@ -193,7 +193,7 @@ pnpm typecheck      # tsc --noEmit on both node + web tsconfigs
 
 # also available individually:
 pnpm build:audio-helper   # swiftc → build/bin/audio-helper
-pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-base.en.bin
+pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-medium.bin
 
 # sanity test the upload-token endpoint (must have pnpm dev running)
 curl http://localhost:13373/start-recording
@@ -308,7 +308,7 @@ app works without it.
     before triggering the AI summary.
 
 11. **`extraResources` in `electron-builder.yml`** copies `audio-helper`,
-    `whisper-cli`, and `ggml-base.en.bin` into `Recall.app/Contents/Resources/`.
+    `whisper-cli`, and `ggml-medium.bin` into `meepcall.app/Contents/Resources/`.
     `electron-builder` auto-codesigns Mach-O binaries it finds there using the
     inherited entitlements. If you add another helper, add it to `extraResources`
     AND verify with `codesign -dvv` after `pnpm build:mac`.
@@ -333,7 +333,7 @@ Explicitly **not** going to do:
 - Per-user account system
 - Alternate transcription providers in the UI. The meeting path uses
   `recallai_streaming` (`server.ts`); the ad-hoc path uses local whisper.cpp
-  (`whisper.ts` → `whisper-cli` with `ggml-base.en.bin`). Swap there if you
+  (`whisper.ts` → `whisper-cli` with `ggml-medium.bin`). Swap there if you
   want a different provider.
 
 ---
