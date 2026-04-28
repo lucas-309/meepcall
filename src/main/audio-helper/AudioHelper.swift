@@ -118,8 +118,26 @@ func convertAndEmit(buffer inputBuffer: AVAudioPCMBuffer, converter: AVAudioConv
 final class MicCapture {
   let engine = AVAudioEngine()
   var converter: AVAudioConverter?
+  var observer: NSObjectProtocol?
+  let lock = NSLock()
 
   func start() throws {
+    try installTapAndStart()
+
+    // AVAudioEngine fires this when the input/output device changes (AirPods
+    // plugging in, headphones, sample-rate switch). The engine's nodes are
+    // stopped and the existing tap+converter are stale — rebuild from the new
+    // input format or the helper goes silent.
+    observer = NotificationCenter.default.addObserver(
+      forName: .AVAudioEngineConfigurationChange,
+      object: engine,
+      queue: .main
+    ) { [weak self] _ in
+      self?.handleConfigChange()
+    }
+  }
+
+  private func installTapAndStart() throws {
     let input = engine.inputNode
     let inputFormat = input.outputFormat(forBus: 0)
     guard inputFormat.sampleRate > 0 else {
@@ -129,14 +147,15 @@ final class MicCapture {
         userInfo: [NSLocalizedDescriptionKey: "input format invalid (no mic permission?)"]
       )
     }
-    converter = AVAudioConverter(from: inputFormat, to: outputFormat)
-    if converter == nil {
+    let conv = AVAudioConverter(from: inputFormat, to: outputFormat)
+    guard let conv else {
       throw NSError(
         domain: "audio-helper",
         code: 2,
         userInfo: [NSLocalizedDescriptionKey: "could not create AVAudioConverter for mic"]
       )
     }
+    converter = conv
 
     input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
       guard let self, let conv = self.converter else { return }
@@ -147,7 +166,35 @@ final class MicCapture {
     try engine.start()
   }
 
+  private func handleConfigChange() {
+    lock.lock()
+    defer { lock.unlock() }
+
+    emitJSON(["event": "route_change", "source": "mic"])
+
+    engine.inputNode.removeTap(onBus: 0)
+    if engine.isRunning { engine.stop() }
+    converter = nil
+
+    // Devices can be mid-transition for ~100ms (sampleRate=0). Retry briefly.
+    for attempt in 1...5 {
+      do {
+        try installTapAndStart()
+        emitJSON(["event": "route_recovered", "source": "mic", "attempt": attempt])
+        return
+      } catch {
+        if attempt == 5 {
+          emitError(code: "route_recover_failed", message: error.localizedDescription)
+          return
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+      }
+    }
+  }
+
   func stop() {
+    if let observer { NotificationCenter.default.removeObserver(observer) }
+    observer = nil
     engine.inputNode.removeTap(onBus: 0)
     engine.stop()
   }
