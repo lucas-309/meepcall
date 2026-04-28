@@ -3,7 +3,8 @@ import { electronApp, optimizer } from '@electron-toolkit/utils'
 import 'dotenv/config'
 
 import { createWindow, getMainWindow, sendToRenderer } from './window'
-import { initSDK, startAdHocRecording, stopManualRecording } from './recall-sdk'
+import { initSDK } from './recall-sdk'
+import { killAllHelpers, startAdHocRecording, stopManualRecording } from './audio-capture'
 import { registerIpcHandlers } from './ipc'
 import { ensureMeetingsFile } from './storage'
 import { sdkLogger } from './sdk-logger'
@@ -19,8 +20,7 @@ async function toggleRecordingFromHotkey(): Promise<void> {
   if (active.length > 0) {
     // Stop the most recently started recording
     const [recordingId] = active.sort(
-      (a, b) =>
-        new Date(b[1].startTime).getTime() - new Date(a[1].startTime).getTime()
+      (a, b) => new Date(b[1].startTime).getTime() - new Date(a[1].startTime).getTime()
     )[0]
     log.recall(`Hotkey: stopping recording ${recordingId.slice(0, 8)}…`)
     new Notification({
@@ -75,10 +75,7 @@ app.whenReady().then(async () => {
   if (globalShortcut.register(RECORD_HOTKEY, () => void toggleRecordingFromHotkey())) {
     log.ok('hotkey', `Registered ${RECORD_HOTKEY} — toggles recording from anywhere`)
   } else {
-    log.warn(
-      'hotkey',
-      `Failed to register ${RECORD_HOTKEY} — another app may be holding it`
-    )
+    log.warn('hotkey', `Failed to register ${RECORD_HOTKEY} — another app may be holding it`)
   }
 
   const mainWindow = getMainWindow()
@@ -101,4 +98,5 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
+  killAllHelpers()
 })

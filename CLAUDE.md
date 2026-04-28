@@ -1,9 +1,13 @@
 # CLAUDE.md — agent-friendly project docs
 
 Personal macOS meeting + call recorder. Electron-vite + TypeScript + React app
-that wraps Recall.ai's Desktop SDK for meeting detection / recording / live
-transcript, with Anthropic Claude for AI summarization. Forked-by-reimplementation
-from Recall's `muesli-public` reference app — same SDK shape, modernized stack.
+with a **split engine**: Recall.ai's Desktop SDK handles Zoom / Meet / Teams
+meeting auto-detection (it owns the `meeting-detected` event + per-participant
+transcripts on those platforms), and a local Swift sidecar (ScreenCaptureKit +
+AVAudioEngine) feeds chunked **whisper.cpp** transcription for everything else
+(⌘⇧R hotkey, Record Audio button, comm-app banner, in-person, phone calls).
+Anthropic Claude generates the summary on stop. Forked-by-reimplementation from
+Recall's `muesli-public` reference app — same SDK shape, modernized stack.
 
 **Lucas's machine** (`/Users/lucashe309/Developer/recall/`). macOS Apple Silicon
 only — every other platform is intentionally out of scope.
@@ -27,10 +31,15 @@ only — every other platform is intentionally out of scope.
 3. **`Authorization: Token <key>`** for Recall API — not `Bearer`. This is the
    single most likely thing to copy-paste wrong from generic API docs.
 
-4. **The transcript provider is `recallai_streaming`**, NOT `assembly_ai_v3_streaming`.
-   Muesli's default required AssemblyAI credentials configured in the workspace.
-   We swapped to Recall's first-party streaming. If you see 400s about
-   "AssemblyAI credentials not configured", check `src/main/server.ts`.
+4. **Two transcription paths.** For Zoom/Meet/Teams (the `meeting-detected`
+   path), Recall's first-party `recallai_streaming` provider transcribes
+   server-side and pushes `transcript.data` events through the SDK. For ad-hoc
+   recordings (the ⌘⇧R / Record Audio / comm-app paths), a local Swift sidecar
+   (`build/bin/audio-helper`) emits 16 kHz mono Int16 PCM, Node chunks every
+   5 s, and `build/bin/whisper-cli` (whisper.cpp) transcribes locally with
+   `ggml-base.en.bin`. The mic and system audio are captured as **separate**
+   helper processes so we can label them `"You"` and `"Other"` respectively
+   (whisper itself doesn't diarize).
 
 5. **`.env` keys must match the region.** Recall workspaces are region-scoped.
    401s with "Invalid API token" almost always = key/URL region mismatch, not
@@ -46,14 +55,27 @@ only — every other platform is intentionally out of scope.
 
 ```
 main process
-├── recall-sdk.ts          Recall SDK init + 8 event listeners + recording flows
-├── server.ts              Express server on :13373 + mintUploadToken() (called
-│                          directly by main, NOT via loopback HTTP — Muesli's
-│                          axios-to-localhost pattern was simplified)
+├── recall-sdk.ts          Recall SDK init + meeting-detected listeners +
+│                          createMeetingNoteAndRecord (Zoom/Meet/Teams ONLY)
+├── audio-capture.ts       local recording engine: spawns two audio-helper
+│                          sidecars per recording (mic + system), chunks every
+│                          5s, drives whisper, fires transcript-updated
+├── audio-helper/          Swift source (ScreenCaptureKit + AVAudioEngine);
+│                          built into build/bin/audio-helper via build.sh
+├── whisper.ts             whisper-cli wrapper. Per-source serial queue,
+│                          hallucination filter, "You" / "Other" labeling.
+├── post-recording.ts      shared "after stop" pipeline (recordingComplete,
+│                          generate summary, fire recording-completed) used
+│                          by both the Recall and the local paths
+├── wav.ts                 30-line WAV header writer for chunk files
+├── assets.ts              resolves bin/ and models/ paths (dev vs packaged)
+├── server.ts              Express server on :13373 + mintUploadToken (still
+│                          used by createMeetingNoteAndRecord for the meeting
+│                          path; unused on ad-hoc)
 ├── ai-summary.ts          Anthropic SDK direct, claude-sonnet-4-6 streaming,
 │                          system prompt has cache_control (no-op until prompt
 │                          exceeds Sonnet 4.6's 2048-token minimum)
-├── ipc.ts                 11 ipcMain handlers — request/invoke + push channels
+├── ipc.ts                 ipcMain handlers — request/invoke + push channels
 ├── storage.ts             race-safe meetings.json store with caching + queued
 │                          ops (port of Muesli's fileOperationManager)
 ├── state.ts               singleton: detectedMeeting, activeMeetingIds, recordings
@@ -118,12 +140,11 @@ Recall SDK fires realtime-event (every speech utterance)
       → MeetingsContext.reload() → re-renders LiveTranscript card
 ```
 
-**Recording end → AI summary**:
+**Recording end → AI summary** (shared by both engines):
 
 ```
-SDK fires recording-ended
-  → updateNoteWithRecordingInfo(windowId)
-    → finds meeting by recordingId
+recall-sdk.updateNoteWithRecordingInfo OR audio-capture.stopManualRecording
+  → runPostRecording(noteId)        ← src/main/post-recording.ts
     → marks recordingComplete + recordingEndTime
     → if transcript.length > 0:
       → generateMeetingSummary(meeting, onProgress)
@@ -134,10 +155,24 @@ SDK fires recording-ended
     → sendToRenderer('recording-completed', meetingId)
 ```
 
-**Phone-call / ad-hoc recording**:
+**Phone-call / ad-hoc recording (local engine)**:
 
-Same shape but uses `RecallAiSdk.prepareDesktopAudioRecording()` for the
-windowId and synthesizes a meeting note. Triggers:
+```
+⌘⇧R hotkey OR Record Audio button OR comm-app banner click
+  → audio-capture.startAdHocRecording(label)
+    → randomUUID() recordingId; create note in meetings.json
+    → spawn audio-helper --source mic   (AVAudioEngine → stdout PCM)
+    → spawn audio-helper --source system (SCStream     → stdout PCM)
+    → every 5s of stdout per source: write WAV → whisper-cli → entries
+    → entries appended with speaker="You" (mic) or "Other" (system)
+    → sendToRenderer('transcript-updated', noteId) per chunk
+  ⌘⇧R again
+  → audio-capture.stopManualRecording(recordingId)
+    → SIGTERM both helpers → drain residual buffers → final whisper pass
+    → runPostRecording(noteId) (shared with the meeting path above)
+```
+
+Triggers for the local engine:
 1. Header `Record Audio` button → `startAdHocRecording(label)`
 2. `⌘⇧R` global hotkey → toggles record/stop
 3. Comm-app banner (Discord/FaceTime/etc detected) → same button, label changes
@@ -147,16 +182,27 @@ windowId and synthesizes a meeting note. Triggers:
 ## Commands
 
 ```bash
+# one-time: build the Swift sidecar + fetch/build whisper-cli + model
+# (requires cmake — `brew install cmake` if missing). ~30s on M-series.
+pnpm prebuild:assets
+
 pnpm dev            # electron-vite dev server + Electron window
 pnpm build          # typecheck + bundle main/preload/renderer
-pnpm build:mac      # bundle + electron-builder DMG (macOS)
+pnpm build:mac      # prebuild:assets + bundle + electron-builder DMG (macOS)
 pnpm typecheck      # tsc --noEmit on both node + web tsconfigs
-pnpm typecheck:node # main + preload + shared only
-pnpm typecheck:web  # renderer only
+
+# also available individually:
+pnpm build:audio-helper   # swiftc → build/bin/audio-helper
+pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-base.en.bin
 
 # sanity test the upload-token endpoint (must have pnpm dev running)
 curl http://localhost:13373/start-recording
 # → {"status":"success","upload_token":"..."}
+
+# sanity test the audio-helper in isolation (mic mode for 3s):
+./build/bin/audio-helper --source mic > /tmp/mic.raw 2> /tmp/mic.err &
+sleep 3 && kill %1
+ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
 
 # stop the dev server
 # Ctrl-C in terminal, OR ⌘Q on the Electron window
@@ -241,13 +287,31 @@ app works without it.
 
 7. **The Recall SDK's `meeting-detected` only fires for Zoom/Meet/Teams/Slack.**
    Discord/FaceTime/WhatsApp/etc. are NOT detected by the SDK — they're surfaced
-   via our own `app-watcher.ts` polling and trigger ad-hoc recording (which uses
-   `prepareDesktopAudioRecording` to capture all desktop audio).
+   via our own `app-watcher.ts` polling and trigger ad-hoc recording, which
+   now goes through the **local engine** (`audio-capture.ts`), not Recall.
 
 8. **Idempotency guard at the top of `createMeetingNoteAndRecord`**: if the user
    double-clicks Record Meeting, the second call returns the existing note id
    instead of creating a duplicate. Don't remove this — both Muesli's
    notification click handler AND the in-app button can fire.
+
+9. **whisper.cpp hallucinations on silence.** `base.en` regularly emits
+   `"Thank you."`, `"Thanks for watching."`, or `"you"` on silent chunks. We
+   filter those in `whisper.ts` (regex + same-as-previous dedup) and pass
+   `--no-speech-thold 0.6` to the binary. If a real utterance happens to match
+   the filter regex, it gets dropped — accept it for v1.
+
+10. **Two audio-helper child processes per recording.** Mic and system audio
+    are captured by separate sidecars so we can label transcript entries
+    `"You"` vs `"Other"`. Killing one doesn't kill the other; `stopManualRecording`
+    SIGTERMs both, then awaits the residual chunk's whisper transcription
+    before triggering the AI summary.
+
+11. **`extraResources` in `electron-builder.yml`** copies `audio-helper`,
+    `whisper-cli`, and `ggml-base.en.bin` into `Recall.app/Contents/Resources/`.
+    `electron-builder` auto-codesigns Mach-O binaries it finds there using the
+    inherited entitlements. If you add another helper, add it to `extraResources`
+    AND verify with `codesign -dvv` after `pnpm build:mac`.
 
 ---
 
@@ -267,8 +331,10 @@ Explicitly **not** going to do:
 - Auto-update (`electron-updater` isn't a dep)
 - Tests / CI
 - Per-user account system
-- Alternate transcription providers in the UI (provider is hardcoded to
-  `recallai_streaming` in `server.ts`; swap there if you want AssemblyAI back)
+- Alternate transcription providers in the UI. The meeting path uses
+  `recallai_streaming` (`server.ts`); the ad-hoc path uses local whisper.cpp
+  (`whisper.ts` → `whisper-cli` with `ggml-base.en.bin`). Swap there if you
+  want a different provider.
 
 ---
 
@@ -283,10 +349,14 @@ Explicitly **not** going to do:
 ## Files this doc is current for
 
 Last verified against:
-- `src/main/index.ts` — global hotkey `⌘⇧R`, app-watcher startup, IPC + SDK init
-- `src/main/recall-sdk.ts` — meeting flows, transcript handler, ad-hoc recording
+- `src/main/index.ts` — global hotkey `⌘⇧R`, audio-helper teardown on quit
+- `src/main/recall-sdk.ts` — meeting-detected flow ONLY (ad-hoc moved out)
+- `src/main/audio-capture.ts` — local recording engine (Swift sidecar + chunks)
+- `src/main/whisper.ts` — whisper-cli wrapper, hallucination filter, mic/system
+- `src/main/post-recording.ts` — shared "after stop" pipeline
+- `src/main/audio-helper/AudioHelper.swift` — ScreenCaptureKit + AVAudioEngine
 - `src/main/ai-summary.ts` — Anthropic SDK direct, claude-sonnet-4-6 streaming
-- `src/main/server.ts` — `recallai_streaming` provider, `Token` auth
+- `src/main/server.ts` — `recallai_streaming` provider for meeting path, `Token` auth
 - `src/renderer/src/pages/NoteEditor.tsx` — LiveTranscript + AISummary cards
 - `src/renderer/src/components/Header.tsx` — comm-app-aware Record Audio button
 

@@ -12,6 +12,13 @@ files:
 asarUnpack:
   - resources/**
   - node_modules/@recallai/**
+extraResources:
+  - from: build/bin/audio-helper
+    to: bin/audio-helper
+  - from: build/bin/whisper-cli
+    to: bin/whisper-cli
+  - from: build/models/ggml-base.en.bin
+    to: models/ggml-base.en.bin
 mac:
   target:
     - dmg

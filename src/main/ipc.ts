@@ -1,16 +1,8 @@
 import { ipcMain } from 'electron'
-import {
-  joinDetectedMeeting,
-  startAdHocRecording,
-  startManualRecording,
-  stopManualRecording
-} from './recall-sdk'
+import { joinDetectedMeeting } from './recall-sdk'
+import { startAdHocRecording, startManualRecording, stopManualRecording } from './audio-capture'
 import { generateMeetingSummary } from './ai-summary'
-import {
-  readMeetingsData,
-  scheduleOperation,
-  writeMeetingsData
-} from './storage'
+import { readMeetingsData, scheduleOperation, writeMeetingsData } from './storage'
 import { state } from './state'
 import { sendToRenderer } from './window'
 import type { MeetingsData } from '@shared/types'
@@ -162,6 +154,8 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('debugGetHandlers', () => {
     // Best-effort; ipcMain has no public API to enumerate handlers
-    return Object.keys((ipcMain as unknown as { _invokeHandlers?: Record<string, unknown> })._invokeHandlers ?? {})
+    return Object.keys(
+      (ipcMain as unknown as { _invokeHandlers?: Record<string, unknown> })._invokeHandlers ?? {}
+    )
   })
 }

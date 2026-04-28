@@ -13,11 +13,14 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
+    "build:audio-helper": "bash src/main/audio-helper/build.sh",
+    "fetch:whisper-assets": "bash scripts/fetch-whisper-assets.sh",
+    "prebuild:assets": "npm run fetch:whisper-assets && npm run build:audio-helper",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
-    "build:unpack": "npm run build && electron-builder --dir",
+    "build:unpack": "npm run prebuild:assets && npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
-    "build:mac": "electron-vite build && electron-builder --mac",
+    "build:mac": "npm run prebuild:assets && electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux"
   },
   "dependencies": {
