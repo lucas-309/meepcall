@@ -9,7 +9,7 @@ AVAudioEngine) feeds chunked **whisper.cpp** transcription for everything else
 Anthropic Claude generates the summary on stop. Forked-by-reimplementation from
 Recall's `muesli-public` reference app — same SDK shape, modernized stack.
 
-**Lucas's machine** (`/Users/lucashe309/Developer/recall/`). macOS Apple Silicon
+**Lucas's machine** (`/Users/lucashe309/Developer/meepcall/`). macOS Apple Silicon
 only — every other platform is intentionally out of scope.
 
 ---
