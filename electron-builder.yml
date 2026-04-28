@@ -1,5 +1,5 @@
-appId: ai.recall.recall
-productName: Recall
+appId: ai.meepcall.meepcall
+productName: meepcall
 directories:
   buildResources: build
 files:
@@ -17,8 +17,8 @@ extraResources:
     to: bin/audio-helper
   - from: build/bin/whisper-cli
     to: bin/whisper-cli
-  - from: build/models/ggml-base.en.bin
-    to: models/ggml-base.en.bin
+  - from: build/models/ggml-small.bin
+    to: models/ggml-small.bin
 mac:
   target:
     - dmg
@@ -28,10 +28,10 @@ mac:
   entitlementsInherit: build/entitlements.mac.plist
   notarize: false
   extendInfo:
-    NSCameraUsageDescription: Recall needs camera access to record participant video.
-    NSMicrophoneUsageDescription: Recall needs microphone access to record meeting audio.
-    NSScreenCaptureUsageDescription: Recall needs screen recording access to capture meetings.
-    NSAccessibilityUsageDescription: Recall uses accessibility access to detect meetings.
+    NSCameraUsageDescription: meepcall needs camera access to record participant video.
+    NSMicrophoneUsageDescription: meepcall needs microphone access to record meeting audio.
+    NSScreenCaptureUsageDescription: meepcall needs screen recording access to capture meetings.
+    NSAccessibilityUsageDescription: meepcall uses accessibility access to detect meetings.
     NSUserNotificationAlertStyle: alert
 dmg:
   artifactName: ${name}-${version}.${ext}
