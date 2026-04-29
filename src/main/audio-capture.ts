@@ -12,6 +12,15 @@ import { writeWavFile } from './wav'
 import { createWhisperSession, type WhisperSession, type WhisperSource } from './whisper'
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
+import { startRecallAdHocRecording, stopRecallRecording } from './recall-sdk'
+
+// Reversible eval flag: when on, route ALL ad-hoc recordings through the
+// Recall SDK's prepareDesktopAudioRecording flow instead of the local Swift +
+// whisper pipeline. Flip off (unset / =0) to return to local. Read on each
+// call so toggling between runs is enough — no code changes needed.
+function useRecallForAdHoc(): boolean {
+  return process.env.MEEPCALL_USE_RECALL_FOR_ADHOC === '1'
+}
 
 // Sliding-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
 // pipeline advances by STEP_SECONDS per chunk, so adjacent chunks overlap
@@ -246,6 +255,11 @@ export async function startAdHocRecording(
 ): Promise<
   { success: true; meetingId: string; recordingId: string } | { success: false; error: string }
 > {
+  if (useRecallForAdHoc()) {
+    log.recall('MEEPCALL_USE_RECALL_FOR_ADHOC=1 — routing ad-hoc recording through Recall SDK')
+    return startRecallAdHocRecording(label)
+  }
+
   const now = new Date()
   const id = `meeting-${Date.now()}`
   const recordingId = randomUUID()
@@ -311,6 +325,12 @@ export async function stopManualRecording(
 ): Promise<{ success: true } | { success: false; error: string }> {
   const handle = handles.get(recordingId)
   if (!handle) {
+    // No local handle — this might be a Recall-routed ad-hoc recording.
+    // The recording-ended event handler will fire runPostRecording.
+    if (state.activeMeetingIds[recordingId]) {
+      log.recall(`stopManualRecording: routing to Recall (window=${recordingId.slice(0, 8)}…)`)
+      return stopRecallRecording(recordingId)
+    }
     return { success: false, error: 'Recording not found' }
   }
   state.updateRecordingState(recordingId, 'stopping')

@@ -404,3 +404,92 @@ export async function joinDetectedMeeting(): Promise<{
 // pipeline in `audio-capture.ts`. The Recall SDK is now used only for
 // Zoom / Meet / Teams / Slack auto-detected meetings via `joinDetectedMeeting`
 // → `createMeetingNoteAndRecord` above.
+//
+// EXCEPT when MEEPCALL_USE_RECALL_FOR_ADHOC=1 is set — then ad-hoc recordings
+// (⌘⇧R, Record Audio, comm-app banner) ALSO route through Recall via the
+// `prepareDesktopAudioRecording` flow below. Reversible per run; flip the env
+// var off to return to local-whisper pipeline.
+
+export async function startRecallAdHocRecording(label?: string): Promise<
+  { success: true; meetingId: string; recordingId: string } | { success: false; error: string }
+> {
+  const now = new Date()
+  const id = `meeting-${Date.now()}`
+  const title =
+    label?.trim() ||
+    `Audio Recording — ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+
+  log.recall(`Recall ad-hoc recording: creating note ${id} ("${title}")`)
+
+  let windowId: string
+  try {
+    sdkLogger.logApiCall('prepareDesktopAudioRecording', {})
+    windowId = await RecallAiSdk.prepareDesktopAudioRecording()
+  } catch (err) {
+    const msg = (err as Error).message
+    log.err('recall', `prepareDesktopAudioRecording failed: ${msg}`)
+    return { success: false, error: `prepareDesktopAudioRecording failed: ${msg}` }
+  }
+
+  const data = await readMeetingsData()
+  const newMeeting: Meeting = {
+    id,
+    type: 'document',
+    title,
+    subtitle: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    hasDemo: false,
+    date: now.toISOString(),
+    participants: [],
+    content: `# ${title}\nRecording: In Progress...`,
+    recordingId: windowId,
+    platform: 'Recall (ad-hoc)',
+    transcript: []
+  }
+  data.pastMeetings.unshift(newMeeting)
+  await writeMeetingsData(data)
+
+  state.activeMeetingIds[windowId] = { platformName: 'Recall (ad-hoc)', noteId: id }
+  state.addRecording(windowId, id, 'Recall (ad-hoc)')
+
+  try {
+    const uploadData = await mintUploadToken()
+    if (uploadData.status !== 'success' || !uploadData.upload_token) {
+      state.removeRecording(windowId)
+      delete state.activeMeetingIds[windowId]
+      return { success: false, error: 'No upload token returned' }
+    }
+    sdkLogger.logApiCall('startRecording', {
+      windowId,
+      uploadToken: `${uploadData.upload_token.slice(0, 8)}...`
+    })
+    log.recall(`Calling startRecording for ad-hoc (token=${uploadData.upload_token.slice(0, 8)}…)`)
+    await RecallAiSdk.startRecording({ windowId, uploadToken: uploadData.upload_token })
+  } catch (err) {
+    state.removeRecording(windowId)
+    delete state.activeMeetingIds[windowId]
+    return { success: false, error: (err as Error).message }
+  }
+
+  setTimeout(() => sendToRenderer('open-meeting-note', id), 300)
+  return { success: true, meetingId: id, recordingId: windowId }
+}
+
+export async function stopRecallRecording(
+  windowId: string
+): Promise<{ success: true } | { success: false; error: string }> {
+  try {
+    state.updateRecordingState(windowId, 'stopping')
+    sdkLogger.logApiCall('stopRecording', { windowId })
+    log.recall(`Calling stopRecording (window=${windowId.slice(0, 8)}…)`)
+    await RecallAiSdk.stopRecording({ windowId })
+    // recording-ended event handler will call runPostRecording.
+    return { success: true }
+  } catch (err) {
+    return { success: false, error: (err as Error).message }
+  }
+}
+
+export function isRecallAdHocActive(windowId: string): boolean {
+  const tracking = state.activeMeetingIds[windowId]
+  return tracking?.platformName === 'Recall (ad-hoc)'
+}
