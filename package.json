@@ -13,6 +13,7 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
+    "prod": "./dist/mac-arm64/meepcall.app/Contents/MacOS/meepcall",
     "build:audio-helper": "bash src/main/audio-helper/build.sh",
     "fetch:whisper-assets": "bash scripts/fetch-whisper-assets.sh",
     "prebuild:assets": "npm run fetch:whisper-assets && npm run build:audio-helper",
