@@ -35,48 +35,60 @@ Roadmap (not in v0.1): voice-activity-triggered record, calendar-triggered recor
 Apple Silicon macOS 13+ only. The Recall Desktop SDK doesn't ship for anything else.
 
 ```bash
-brew install cmake          # one-time, needed to build whisper-cli from source
+# 1. Prereqs (one-time). If you don't have Homebrew: brew.sh
+brew install node pnpm cmake
+
+# 2. Get the code
 git clone https://github.com/lucas-309/meepcall.git
 cd meepcall
 pnpm install
-pnpm prebuild:assets        # builds the Swift sidecar + whisper-cli, downloads ~1.6 GB model
+
+# 3. Build the local audio engine + download the whisper model
+#    (~5 min on first run; ~1.6 GB download)
+pnpm prebuild:assets
+
+# 4. Configure API keys
 cp .env.example .env
-# edit .env — see below
+#    Open .env in your editor and fill in:
+#      - RECALLAI_API_KEY: required for Zoom/Meet/Teams auto-detect.
+#        Sign up at recall.ai — new accounts get a few free hours.
+#      - ANTHROPIC_API_KEY: optional. Only used for AI summaries
+#        on call end. App runs fine without it.
+
+# 5. Run
 pnpm dev
 ```
 
-`pnpm prebuild:assets` is required before the first `pnpm dev`. It builds `build/bin/audio-helper` (the ScreenCaptureKit + AVAudioEngine sidecar) and `build/bin/whisper-cli`, and downloads `build/models/ggml-large-v3-turbo.bin` (~1.6 GB) from Hugging Face plus `build/models/silero-vad.onnx` (~2.3 MB) from `snakers4/silero-vad`. Idempotent — re-runs are no-ops once the files are in place.
+**First launch:** macOS will prompt for **Microphone**, **Screen Recording**, and **Accessibility**. Approve all three, then **quit and relaunch** the app — Accessibility doesn't take effect without a fresh start.
 
-`.env`:
+**To record anything:** press `⌘⇧R` from anywhere on your machine. Press `⌘⇧R` again to stop. Works for phone calls (over iPhone Continuity), Discord, FaceTime, in-person meetings, your voice — anything that makes sound. The transcript scrolls in as you talk; the AI summary streams in once you stop. Zoom / Google Meet / Microsoft Teams calls additionally show a yellow banner — click **Record Meeting** for per-participant speaker labels via Recall.
 
-```
-RECALLAI_API_URL=https://us-west-2.recall.ai   # match your workspace region
-RECALLAI_API_KEY=<recall key>
-ANTHROPIC_API_KEY=sk-ant-...
-```
+That's it.
 
-Region URL options: `us-west-2` (PAYG), `us-east-1` (Monthly), `eu-central-1` (EU), `ap-northeast-1` (Japan). 401s with "Invalid API token" are almost always a region mismatch, not actually invalid keys. The Anthropic key is optional at boot — the app runs without it; only `Generate AI Summary` will fail.
+### Recall regions
 
-First launch: macOS will prompt for Accessibility, Screen Recording, Microphone, and Input Monitoring. Approve all four. **Quit and relaunch** after granting Accessibility — the SDK doesn't see the grant until a fresh start.
+Pick the URL for your Recall workspace in `.env`: `us-west-2.recall.ai` (PAYG), `us-east-1.recall.ai` (Monthly), `eu-central-1.recall.ai` (EU), `ap-northeast-1.recall.ai` (Japan). 401s with "Invalid API token" are almost always a region mismatch, not actually invalid keys.
 
-Sanity check the upload-token server (used by the Recall meeting path):
+### Setup details (advanced)
+
+**Production-signed run with logs in your terminal:** `pnpm build:mac && pnpm prod`. Useful when you want logs attached to the terminal from a packaged build instead of the dev-mode Electron bundle. ⌃C cleanly quits.
+
+**Distributable DMG:** `pnpm build:mac`. Configure your Apple Developer ID in `electron-builder.yml` for signing/notarization. Without one, electron-builder ad-hoc signs the .app and ships with `hardenedRuntime: false` (needed for the dyld loader to accept ad-hoc signed frameworks; fine for personal use, not for distribution outside your machine). `extraResources` binaries (`audio-helper`, `whisper-cli`, ONNX model) get auto-codesigned alongside the bundle.
+
+**Sanity-check the upload-token server** (used only by the Recall meeting path):
 
 ```bash
 curl http://localhost:13373/start-recording
 # {"status":"success","upload_token":"..."}
 ```
 
-Sanity check the Swift sidecar in isolation:
+**Sanity-check the Swift sidecar in isolation:**
 
 ```bash
 ./build/bin/audio-helper --source mic > /tmp/mic.raw 2> /tmp/mic.err &
 sleep 3 && kill %1
 ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
 ```
-
-`pnpm dev` for hot-reload development. `pnpm build:mac && pnpm prod` for a packaged app run with stdout/stderr attached to your terminal — useful when you want logs from the production-signed build instead of the dev-mode Electron bundle. ⌃C in the same terminal cleanly quits.
-
-Build a DMG with `pnpm build:mac`. Configure your Apple Developer ID in `electron-builder.yml` first if you want it signed and notarized — without one, electron-builder ad-hoc signs the .app and ships with `hardenedRuntime: false` (needed for the dyld loader to accept ad-hoc signed frameworks; not suitable for distribution outside your machine). `electron-builder` auto-codesigns the bundled `audio-helper`, `whisper-cli`, and ONNX model binaries from `extraResources`.
 
 ### Tunable env vars
 
