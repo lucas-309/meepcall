@@ -19,11 +19,14 @@ export interface WhisperSession {
   destroy(): void
 }
 
-// Default to the multilingual `medium` model (~1.5 GB). Override via env var:
-//   WHISPER_MODEL=ggml-small.bin   (multilingual, smaller/faster, more hallucinations)
-//   WHISPER_MODEL=ggml-base.en.bin (English-only, smallest, fastest)
-//   WHISPER_MODEL=ggml-large-v3.bin (multilingual, ~3 GB, best quality, slowest)
-const MODEL_NAME = process.env.WHISPER_MODEL?.trim() || 'ggml-medium.bin'
+// Default to `large-v3-turbo` (~1.6 GB) — distilled from large-v3, ~99% of
+// SOTA quality at medium-model speed. Per-chunk inference fits inside the
+// 2-second pipeline step on M1+, so live transcripts stay in real time.
+//   WHISPER_MODEL=ggml-large-v3.bin     (true SOTA, ~3 GB, M3 Max+ only)
+//   WHISPER_MODEL=ggml-medium.bin       (smaller/older, more hallucinations)
+//   WHISPER_MODEL=ggml-small.bin        (multilingual, smaller/faster)
+//   WHISPER_MODEL=ggml-base.en.bin      (English-only, smallest, fastest)
+const MODEL_NAME = process.env.WHISPER_MODEL?.trim() || 'ggml-large-v3-turbo.bin'
 // `auto` lets whisper detect the language per chunk. Override via env var:
 //   WHISPER_LANGUAGE=en (force English, skip auto-detect)
 //   WHISPER_LANGUAGE=es / zh / ja / ko / fr / etc. (force specific)

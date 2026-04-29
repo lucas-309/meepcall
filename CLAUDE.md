@@ -37,7 +37,7 @@ only — every other platform is intentionally out of scope.
    recordings (the ⌘⇧R / Record Audio / comm-app paths), a local Swift sidecar
    (`build/bin/audio-helper`) emits 16 kHz mono Int16 PCM, Node feeds it
    through a sliding-window chunker (3 s wide, 2 s step, 1 s overlap) into
-   `build/bin/whisper-cli` (whisper.cpp) with `ggml-medium.bin`. The 1 s
+   `build/bin/whisper-cli` (whisper.cpp) with `ggml-large-v3-turbo.bin`. The 1 s
    overlap gives whisper context across cut boundaries; segments inside the
    overlap region are dropped at emit time to prevent duplicate entries.
    The mic and system audio are captured as **separate** helper processes so
@@ -196,7 +196,7 @@ pnpm typecheck      # tsc --noEmit on both node + web tsconfigs
 
 # also available individually:
 pnpm build:audio-helper   # swiftc → build/bin/audio-helper
-pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-medium.bin
+pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-large-v3-turbo.bin
 
 # sanity test the upload-token endpoint (must have pnpm dev running)
 curl http://localhost:13373/start-recording
@@ -311,7 +311,7 @@ app works without it.
     before triggering the AI summary.
 
 11. **`extraResources` in `electron-builder.yml`** copies `audio-helper`,
-    `whisper-cli`, and `ggml-medium.bin` into `meepcall.app/Contents/Resources/`.
+    `whisper-cli`, and `ggml-large-v3-turbo.bin` into `meepcall.app/Contents/Resources/`.
     `electron-builder` auto-codesigns Mach-O binaries it finds there using the
     inherited entitlements. If you add another helper, add it to `extraResources`
     AND verify with `codesign -dvv` after `pnpm build:mac`.
@@ -336,7 +336,7 @@ Explicitly **not** going to do:
 - Per-user account system
 - Alternate transcription providers in the UI. The meeting path uses
   `recallai_streaming` (`server.ts`); the ad-hoc path uses local whisper.cpp
-  (`whisper.ts` → `whisper-cli` with `ggml-medium.bin`). Swap there if you
+  (`whisper.ts` → `whisper-cli` with `ggml-large-v3-turbo.bin`). Swap there if you
   want a different provider.
 
 ---
