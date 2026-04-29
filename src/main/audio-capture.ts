@@ -12,7 +12,12 @@ import { writeWavFile } from './wav'
 import { createWhisperSession, type WhisperSession, type WhisperSource } from './whisper'
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
-import { startRecallAdHocRecording, stopRecallRecording } from './recall-sdk'
+import {
+  startCompareModeRecallRecording,
+  startRecallAdHocRecording,
+  stopCompareModeRecallRecording,
+  stopRecallRecording
+} from './recall-sdk'
 
 // Reversible eval flag: when on, route ALL ad-hoc recordings through the
 // Recall SDK's prepareDesktopAudioRecording flow instead of the local Swift +
@@ -20,6 +25,14 @@ import { startRecallAdHocRecording, stopRecallRecording } from './recall-sdk'
 // call so toggling between runs is enough — no code changes needed.
 function useRecallForAdHoc(): boolean {
   return process.env.MEEPCALL_USE_RECALL_FOR_ADHOC === '1'
+}
+
+// Side-by-side eval: when on, run BOTH local whisper and a shadow Recall
+// recording on the same audio. Local writes to the meeting note as normal;
+// Recall transcripts print to terminal only ([recall] tag) for comparison.
+// Costs Recall credits ($0.65/hr) for the duration of the recording.
+function compareModeEnabled(): boolean {
+  return process.env.MEEPCALL_COMPARE_MODE === '1'
 }
 
 // Sliding-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
@@ -288,6 +301,11 @@ export async function startAdHocRecording(
     return { success: false, error: (err as Error).message }
   }
 
+  if (compareModeEnabled()) {
+    log.local('MEEPCALL_COMPARE_MODE=1 — starting parallel shadow Recall recording')
+    void startCompareModeRecallRecording()
+  }
+
   setTimeout(() => sendToRenderer('open-meeting-note', id), 300)
   return { success: true, meetingId: id, recordingId }
 }
@@ -333,6 +351,7 @@ export async function stopManualRecording(
     const stops: Promise<void>[] = []
     if (handle.mic) stops.push(stopSource(handle.mic, handle, 'mic'))
     if (handle.system) stops.push(stopSource(handle.system, handle, 'system'))
+    if (compareModeEnabled()) stops.push(stopCompareModeRecallRecording())
     await Promise.all(stops)
     await handle.whisper.flush()
     handle.whisper.destroy()

@@ -208,6 +208,11 @@ async function processTranscriptData(evt: RealtimeEvent): Promise<void> {
   log.recall(`Transcript [${speaker}]: ${text}`)
 
   if (!windowId) return
+  if (isCompareModeWindow(windowId)) {
+    // Compare mode: terminal-only on purpose, no warn (the [recall] Transcript
+    // line above already printed it; we just don't write to any note).
+    return
+  }
   const tracking = state.activeMeetingIds[windowId]
   if (!tracking?.noteId) {
     log.warn(
@@ -492,4 +497,54 @@ export async function stopRecallRecording(
 export function isRecallAdHocActive(windowId: string): boolean {
   const tracking = state.activeMeetingIds[windowId]
   return tracking?.platformName === 'Recall (ad-hoc)'
+}
+
+// ─── Compare mode (MEEPCALL_COMPARE_MODE=1) ────────────────────────────────
+// Shadow Recall recording that runs in parallel with the local pipeline so
+// you can A/B transcript quality on the same audio. Transcripts print to
+// terminal only — no note, no summary, no meetings.json bookkeeping.
+
+let compareModeWindowId: string | null = null
+
+export function isCompareModeWindow(windowId: string): boolean {
+  return compareModeWindowId !== null && compareModeWindowId === windowId
+}
+
+export async function startCompareModeRecallRecording(): Promise<void> {
+  if (compareModeWindowId) {
+    log.warn('recall', 'Compare mode: shadow Recall already active, skipping start')
+    return
+  }
+  let windowId: string
+  try {
+    windowId = await RecallAiSdk.prepareDesktopAudioRecording()
+  } catch (err) {
+    log.err('recall', `Compare mode prepareDesktopAudioRecording failed: ${(err as Error).message}`)
+    return
+  }
+  try {
+    const uploadData = await mintUploadToken()
+    if (uploadData.status !== 'success' || !uploadData.upload_token) {
+      log.warn('recall', 'Compare mode: no upload token, Recall side skipped')
+      return
+    }
+    compareModeWindowId = windowId
+    log.recall(`Compare mode: shadow Recall starting (window=${windowId.slice(0, 8)}…)`)
+    await RecallAiSdk.startRecording({ windowId, uploadToken: uploadData.upload_token })
+  } catch (err) {
+    log.err('recall', `Compare mode startRecording failed: ${(err as Error).message}`)
+    compareModeWindowId = null
+  }
+}
+
+export async function stopCompareModeRecallRecording(): Promise<void> {
+  if (!compareModeWindowId) return
+  const windowId = compareModeWindowId
+  compareModeWindowId = null
+  try {
+    log.recall(`Compare mode: shadow Recall stopping (window=${windowId.slice(0, 8)}…)`)
+    await RecallAiSdk.stopRecording({ windowId })
+  } catch (err) {
+    log.err('recall', `Compare mode stopRecording failed: ${(err as Error).message}`)
+  }
 }
