@@ -208,7 +208,6 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
       }
 
       recent[source].push({ text: seg.text, absMs: segAbsMs })
-      if (verbose) log.local(`  keep[@${seg.offsetMs}ms]: ${seg.text}`)
       entries.push({
         text: seg.text,
         speaker,
