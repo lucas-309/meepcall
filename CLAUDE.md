@@ -35,11 +35,14 @@ only — every other platform is intentionally out of scope.
    path), Recall's first-party `recallai_streaming` provider transcribes
    server-side and pushes `transcript.data` events through the SDK. For ad-hoc
    recordings (the ⌘⇧R / Record Audio / comm-app paths), a local Swift sidecar
-   (`build/bin/audio-helper`) emits 16 kHz mono Int16 PCM, Node chunks every
-   5 s, and `build/bin/whisper-cli` (whisper.cpp) transcribes locally with
-   `ggml-medium.bin`. The mic and system audio are captured as **separate**
-   helper processes so we can label them `"You"` and `"Other"` respectively
-   (whisper itself doesn't diarize).
+   (`build/bin/audio-helper`) emits 16 kHz mono Int16 PCM, Node feeds it
+   through a sliding-window chunker (3 s wide, 2 s step, 1 s overlap) into
+   `build/bin/whisper-cli` (whisper.cpp) with `ggml-medium.bin`. The 1 s
+   overlap gives whisper context across cut boundaries; segments inside the
+   overlap region are dropped at emit time to prevent duplicate entries.
+   The mic and system audio are captured as **separate** helper processes so
+   we can label them `"You"` and `"Other"` respectively (whisper itself
+   doesn't diarize).
 
 5. **`.env` keys must match the region.** Recall workspaces are region-scoped.
    401s with "Invalid API token" almost always = key/URL region mismatch, not

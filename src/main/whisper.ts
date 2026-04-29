@@ -12,7 +12,9 @@ export interface WhisperSession {
   transcribeChunk(
     wavPath: string,
     chunkIndex: number,
-    source: WhisperSource
+    source: WhisperSource,
+    chunkStartMs: number,
+    skipBeforeMs: number
   ): Promise<TranscriptEntry[]>
   flush(): Promise<void>
   destroy(): void
@@ -124,7 +126,9 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
   async function transcribeChunk(
     wavPath: string,
     chunkIndex: number,
-    source: WhisperSource
+    source: WhisperSource,
+    chunkStartMs: number,
+    skipBeforeMs: number
   ): Promise<TranscriptEntry[]> {
     if (destroyed) return []
     const speaker = source === 'mic' ? 'You' : 'Other'
@@ -137,21 +141,26 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
 
     const entries: TranscriptEntry[] = []
     for (const seg of segs) {
+      // Skip the overlap region — those audio frames were already covered by
+      // the previous chunk and any segments inside them are duplicates.
+      if (seg.offsetMs < skipBeforeMs) continue
       if (isHallucination(seg.text)) continue
       if (seg.text === lastEntry[source]) continue
       lastEntry[source] = seg.text
       entries.push({
         text: seg.text,
         speaker,
-        timestamp: new Date(startedAt + chunkIndex * 5000 + seg.offsetMs).toISOString()
+        timestamp: new Date(startedAt + chunkStartMs + seg.offsetMs).toISOString()
       })
     }
     return entries
   }
 
   return {
-    transcribeChunk(wavPath, chunkIndex, source) {
-      const next = queues[source].then(() => transcribeChunk(wavPath, chunkIndex, source))
+    transcribeChunk(wavPath, chunkIndex, source, chunkStartMs, skipBeforeMs) {
+      const next = queues[source].then(() =>
+        transcribeChunk(wavPath, chunkIndex, source, chunkStartMs, skipBeforeMs)
+      )
       // Keep the queue chain alive but don't propagate rejections.
       queues[source] = next.catch(() => undefined)
       return next

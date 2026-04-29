@@ -13,14 +13,29 @@ import { createWhisperSession, type WhisperSession, type WhisperSource } from '.
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
 
-// 5 seconds at 16 kHz × 16-bit × mono.
-const CHUNK_BYTES = 5 * 16000 * 2
+// Sliding-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
+// pipeline advances by STEP_SECONDS per chunk, so adjacent chunks overlap
+// by (CHUNK_SECONDS - STEP_SECONDS). The overlap gives whisper context
+// across cut boundaries; segments inside the overlap region are dropped
+// at transcript-emit time to avoid duplicate entries.
+const CHUNK_SECONDS = 3
+const STEP_SECONDS = 2
+const OVERLAP_SECONDS = CHUNK_SECONDS - STEP_SECONDS
+
+const STEP_BYTES = STEP_SECONDS * 16000 * 2 // 64,000 — fresh audio per chunk
+const OVERLAP_BYTES = OVERLAP_SECONDS * 16000 * 2 // 32,000 — tail kept around
+const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 96,000 — full chunk fed to whisper
+const STEP_MS = STEP_SECONDS * 1000
+const OVERLAP_MS = OVERLAP_SECONDS * 1000
 
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
   pending: Buffer[]
   pendingBytes: number
   chunkIndex: number
+  // Last OVERLAP_BYTES of the most recently emitted chunk. Prepended to the
+  // next chunk so whisper sees a 3-second window every time.
+  tail: Buffer
   closed: Promise<void>
 }
 
@@ -80,21 +95,32 @@ function attachStdoutPipeline(
   ss: SourceState
 ): void {
   ss.proc.stdout.on('data', (chunk: Buffer) => {
-    let cursor = 0
-    while (cursor < chunk.length) {
-      const remaining = chunk.length - cursor
-      const room = CHUNK_BYTES - ss.pendingBytes
-      const take = Math.min(remaining, room)
-      ss.pending.push(chunk.subarray(cursor, cursor + take))
-      ss.pendingBytes += take
-      cursor += take
-      if (ss.pendingBytes >= CHUNK_BYTES) {
-        const pcm = Buffer.concat(ss.pending, ss.pendingBytes)
-        ss.pending = []
-        ss.pendingBytes = 0
-        const idx = ss.chunkIndex++
-        void flushChunk(source, handle, pcm, idx)
-      }
+    ss.pending.push(chunk)
+    ss.pendingBytes += chunk.length
+
+    // Emit as many chunks as we have data for. The first chunk needs a full
+    // CHUNK_BYTES of fresh audio (no tail yet); every chunk after that needs
+    // STEP_BYTES of fresh audio and prepends the saved tail.
+    while (true) {
+      const isFirst = ss.chunkIndex === 0
+      const needed = isFirst ? CHUNK_BYTES : STEP_BYTES
+      if (ss.pendingBytes < needed) break
+
+      const flat = Buffer.concat(ss.pending, ss.pendingBytes)
+      const fresh = flat.subarray(0, needed)
+      const chunkBuf = isFirst ? fresh : Buffer.concat([ss.tail, fresh])
+      // Save last OVERLAP_BYTES of this chunk for the next one. Buffer.from
+      // copies so we don't keep the full `flat` alive longer than needed.
+      ss.tail = Buffer.from(chunkBuf.subarray(chunkBuf.length - OVERLAP_BYTES))
+
+      const remainder = flat.subarray(needed)
+      ss.pending = remainder.length > 0 ? [remainder] : []
+      ss.pendingBytes = remainder.length
+
+      const idx = ss.chunkIndex++
+      const chunkStartMs = idx * STEP_MS
+      const skipBeforeMs = isFirst ? 0 : OVERLAP_MS
+      void flushChunk(source, handle, chunkBuf, idx, chunkStartMs, skipBeforeMs)
     }
   })
 }
@@ -103,7 +129,9 @@ async function flushChunk(
   source: WhisperSource,
   handle: RecorderHandle,
   pcm: Buffer,
-  chunkIndex: number
+  chunkIndex: number,
+  chunkStartMs: number,
+  skipBeforeMs: number
 ): Promise<void> {
   const wavPath = join(tmpdir(), `meepcall-${handle.recordingId}-${source}-chunk-${chunkIndex}.wav`)
   try {
@@ -113,7 +141,13 @@ async function flushChunk(
     return
   }
   try {
-    const entries = await handle.whisper.transcribeChunk(wavPath, chunkIndex, source)
+    const entries = await handle.whisper.transcribeChunk(
+      wavPath,
+      chunkIndex,
+      source,
+      chunkStartMs,
+      skipBeforeMs
+    )
     fireTranscript(handle.noteId, entries)
   } catch (err) {
     log.err('audio', `whisper chunk failed: ${(err as Error).message}`)
@@ -125,13 +159,21 @@ async function drainAndFlushFinal(
   handle: RecorderHandle,
   ss: SourceState
 ): Promise<void> {
+  // Tail-only (no fresh audio since last chunk) would emit nothing past the
+  // overlap-skip — bail.
   if (ss.pendingBytes === 0) return
-  const pcm = Buffer.concat(ss.pending, ss.pendingBytes)
+
+  const flat = Buffer.concat(ss.pending, ss.pendingBytes)
+  const isFirst = ss.chunkIndex === 0
+  const chunkBuf = isFirst ? flat : Buffer.concat([ss.tail, flat])
   ss.pending = []
   ss.pendingBytes = 0
+
   const idx = ss.chunkIndex++
+  const chunkStartMs = idx * STEP_MS
+  const skipBeforeMs = isFirst ? 0 : OVERLAP_MS
   // Await this final chunk so the transcript is complete before the summary runs.
-  await flushChunk(source, handle, pcm, idx)
+  await flushChunk(source, handle, chunkBuf, idx, chunkStartMs, skipBeforeMs)
 }
 
 function startSource(handle: RecorderHandle, source: WhisperSource): SourceState {
@@ -145,6 +187,7 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
     pending: [],
     pendingBytes: 0,
     chunkIndex: 0,
+    tail: Buffer.alloc(0),
     closed
   }
   attachStdoutPipeline(source, handle, ss)
