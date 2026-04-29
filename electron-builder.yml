@@ -19,6 +19,8 @@ extraResources:
     to: bin/whisper-cli
   - from: build/models/ggml-large-v3-turbo.bin
     to: models/ggml-large-v3-turbo.bin
+  - from: build/models/silero-vad.onnx
+    to: models/silero-vad.onnx
 mac:
   target:
     - dmg

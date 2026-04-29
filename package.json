@@ -32,6 +32,7 @@
     "@recallai/desktop-sdk": "^2.0.11",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "onnxruntime-node": "^1.24.3",
     "react-markdown": "^10.1.0"
   },
   "devDependencies": {
@@ -60,7 +61,8 @@
     "onlyBuiltDependencies": [
       "@recallai/desktop-sdk",
       "electron",
-      "esbuild"
+      "esbuild",
+      "onnxruntime-node"
     ]
   }
 }

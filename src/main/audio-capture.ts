@@ -9,6 +9,7 @@ import { log } from './log'
 import { state } from './state'
 import { readMeetingsData, scheduleOperation, writeMeetingsData } from './storage'
 import { writeWavFile } from './wav'
+import { createSileroVad, FRAME_DURATION_MS, type SileroVad } from './silero-vad'
 import { createWhisperSession, type WhisperSession, type WhisperSource } from './whisper'
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
@@ -50,28 +51,19 @@ const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 96,000 — full chunk fed to wh
 const STEP_MS = STEP_SECONDS * 1000
 
 // Phrase-VAD chunking (MEEPCALL_PHRASE_VAD=1). Cut on natural silence
-// boundaries instead of fixed time slices. Chunks are 1–5 s wide depending on
-// where speech pauses fall.
+// boundaries detected by silero-vad (a small ONNX speech-detection model)
+// instead of fixed time slices. Chunks are 1–5 s wide depending on where
+// real speech pauses fall.
 const PHRASE_MIN_BYTES = 1 * 16000 * 2 // 1 s — don't emit too-short chunks
 const PHRASE_MAX_BYTES = 5 * 16000 * 2 // 5 s — hard cap if no silence detected
-const PHRASE_SILENCE_END_BYTES = 0.4 * 16000 * 2 // 400 ms of trailing silence = phrase end
-// RMS threshold below which a buffer counts as silence. Int16 max is 32767;
-// real-call ambient noise typically sits around 50–200; speech is 1000+.
-const SILENCE_RMS_THRESHOLD = 250
+const PHRASE_SILENCE_END_MS = 400 // 400 ms of trailing silence = phrase end
+// Silero outputs a speech probability 0..1 per 32 ms frame. 0.5 is the
+// canonical threshold from the model card; higher = more selective (less
+// likely to count quiet speech as silence), lower = more permissive.
+const VAD_SPEECH_THRESHOLD = 0.5
 
 function usePhraseVad(): boolean {
   return process.env.MEEPCALL_PHRASE_VAD === '1'
-}
-
-function rmsInt16LE(buf: Buffer): number {
-  const samples = Math.floor(buf.length / 2)
-  if (samples === 0) return 0
-  let sumSq = 0
-  for (let i = 0; i < samples * 2; i += 2) {
-    const s = buf.readInt16LE(i)
-    sumSq += s * s
-  }
-  return Math.sqrt(sumSq / samples)
 }
 
 interface SourceState {
@@ -81,9 +73,13 @@ interface SourceState {
   chunkIndex: number
   // Sliding-window only: last OVERLAP_BYTES of previous chunk.
   tail: Buffer
-  // Phrase-VAD only: bytes of trailing silence accumulated; absolute audio
-  // start time of the next chunk to emit (ms since recording start).
-  silenceBytes: number
+  // Phrase-VAD only: silero VAD instance; per-source serial queue so async
+  // VAD inference calls don't interleave (silero's LSTM state must be fed
+  // sequentially); ms of trailing silence detected; absolute audio start
+  // time of the next chunk to emit (ms since recording start).
+  vad: SileroVad | null
+  vadQueue: Promise<unknown>
+  silenceMs: number
   chunkStartMs: number
   closed: Promise<void>
 }
@@ -145,8 +141,13 @@ function attachStdoutPipeline(
 ): void {
   const vad = usePhraseVad()
   ss.proc.stdout.on('data', (chunk: Buffer) => {
-    if (vad) handlePhraseVadData(chunk, source, handle, ss)
-    else handleSlidingWindowData(chunk, source, handle, ss)
+    if (vad) {
+      // Serialize through the per-source VAD queue. Silero's LSTM state must
+      // be fed sequentially or it corrupts.
+      ss.vadQueue = ss.vadQueue.then(() => handlePhraseVadData(chunk, source, handle, ss))
+    } else {
+      handleSlidingWindowData(chunk, source, handle, ss)
+    }
   })
 }
 
@@ -184,37 +185,42 @@ function handleSlidingWindowData(
   }
 }
 
-function handlePhraseVadData(
+async function handlePhraseVadData(
   chunk: Buffer,
   source: WhisperSource,
   handle: RecorderHandle,
   ss: SourceState
-): void {
+): Promise<void> {
   ss.pending.push(chunk)
   ss.pendingBytes += chunk.length
 
-  // Update trailing-silence counter from this incoming buffer's RMS.
-  // Note: chunk size from the helper is typically ~bufferSize (4096 samples
-  // = 8192 bytes = 256 ms at 16 kHz mono Int16), so the silence window is
-  // accurate to ~quarter-second granularity.
-  if (rmsInt16LE(chunk) < SILENCE_RMS_THRESHOLD) {
-    ss.silenceBytes += chunk.length
-  } else {
-    ss.silenceBytes = 0
+  // Run silero on this incoming buffer. It returns one speech probability
+  // per 32 ms frame (FRAME_DURATION_MS). Frames are accumulated inside the
+  // VAD instance — leftover sub-frame samples are carried over.
+  const vad = ss.vad
+  if (vad) {
+    try {
+      const probs = await vad.process(chunk)
+      for (const p of probs) {
+        if (p < VAD_SPEECH_THRESHOLD) ss.silenceMs += FRAME_DURATION_MS
+        else ss.silenceMs = 0
+      }
+    } catch (err) {
+      log.err('audio', `silero-vad inference failed: ${(err as Error).message}`)
+    }
   }
 
   // Cut conditions: hit the hard cap, OR have enough audio AND a trailing
   // silence period long enough to be a phrase boundary.
   const hitMax = ss.pendingBytes >= PHRASE_MAX_BYTES
-  const hitPause =
-    ss.pendingBytes >= PHRASE_MIN_BYTES && ss.silenceBytes >= PHRASE_SILENCE_END_BYTES
+  const hitPause = ss.pendingBytes >= PHRASE_MIN_BYTES && ss.silenceMs >= PHRASE_SILENCE_END_MS
 
   if (!hitMax && !hitPause) return
 
   const chunkBuf = Buffer.concat(ss.pending, ss.pendingBytes)
   ss.pending = []
   ss.pendingBytes = 0
-  ss.silenceBytes = 0
+  ss.silenceMs = 0
 
   const idx = ss.chunkIndex++
   const chunkStartMs = ss.chunkStartMs
@@ -256,11 +262,21 @@ async function drainAndFlushFinal(
   handle: RecorderHandle,
   ss: SourceState
 ): Promise<void> {
+  const vad = usePhraseVad()
+  // In phrase-VAD mode, wait for any in-flight inference on the queue to
+  // finish first so the chunker has fully reacted to the last bytes.
+  if (vad) {
+    try {
+      await ss.vadQueue
+    } catch {
+      /* ignore */
+    }
+  }
+
   // Nothing fresh since the last chunk — bail.
   if (ss.pendingBytes === 0) return
 
   const flat = Buffer.concat(ss.pending, ss.pendingBytes)
-  const vad = usePhraseVad()
   const isFirst = ss.chunkIndex === 0
   // Phrase-VAD chunks don't overlap, so no tail to prepend.
   const chunkBuf = vad ? flat : isFirst ? flat : Buffer.concat([ss.tail, flat])
@@ -286,9 +302,23 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
     pendingBytes: 0,
     chunkIndex: 0,
     tail: Buffer.alloc(0),
-    silenceBytes: 0,
+    vad: null,
+    vadQueue: Promise.resolve(),
+    silenceMs: 0,
     chunkStartMs: 0,
     closed
+  }
+  // Lazily create the silero VAD only when phrase-VAD mode is on. The first
+  // session creation pays a ~150 ms onnxruntime warm-up; subsequent sources
+  // reuse the cached InferenceSession via getSession().
+  if (usePhraseVad()) {
+    void createSileroVad()
+      .then((v) => {
+        ss.vad = v
+      })
+      .catch((err) => {
+        log.err('audio', `silero-vad init failed: ${(err as Error).message}`)
+      })
   }
   attachStdoutPipeline(source, handle, ss)
   return ss

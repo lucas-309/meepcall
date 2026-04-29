@@ -40,6 +40,8 @@ only — every other platform is intentionally out of scope.
    `build/bin/whisper-cli` (whisper.cpp) with `ggml-large-v3-turbo.bin`. The 1 s
    overlap gives whisper context across cut boundaries; segments inside the
    overlap region are dropped at emit time to prevent duplicate entries.
+   When `MEEPCALL_PHRASE_VAD=1` is set, the chunker switches to silero-vad
+   (`build/models/silero-vad.onnx`) phrase-boundary detection instead.
    The mic and system audio are captured as **separate** helper processes so
    we can label them `"You"` and `"Other"` respectively (whisper itself
    doesn't diarize).

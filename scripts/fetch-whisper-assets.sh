@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Fetch whisper.cpp assets (binary + model) into build/.
+# Fetch whisper.cpp + silero-vad assets into build/.
 # - whisper-cli: built from source at the pinned tag
 # - ggml-large-v3-turbo.bin: downloaded from huggingface (multilingual, ~1.6 GB)
+# - silero-vad.onnx: downloaded from snakers4/silero-vad (~2.3 MB)
 #
 # Idempotent: skips work if files already exist and are non-empty.
 # Set FORCE=1 to redo everything.
@@ -23,8 +24,11 @@ MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
 
 mkdir -p "$BIN_DIR" "$MODEL_DIR"
 
+SILERO_VAD_PATH="$MODEL_DIR/silero-vad.onnx"
+SILERO_VAD_URL="https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
+
 if [ "${FORCE:-0}" = "1" ]; then
-  rm -f "$WHISPER_BIN" "$MODEL_PATH"
+  rm -f "$WHISPER_BIN" "$MODEL_PATH" "$SILERO_VAD_PATH"
 fi
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -76,7 +80,18 @@ else
   echo "✓ whisper-cli already present: $WHISPER_BIN"
 fi
 
+# ─── silero-vad ───────────────────────────────────────────────────────────────
+if [ ! -s "$SILERO_VAD_PATH" ]; then
+  echo "→ downloading silero-vad.onnx …"
+  curl -L --fail --progress-bar -o "$SILERO_VAD_PATH.partial" "$SILERO_VAD_URL"
+  mv "$SILERO_VAD_PATH.partial" "$SILERO_VAD_PATH"
+  echo "  $(du -h "$SILERO_VAD_PATH" | cut -f1) at $SILERO_VAD_PATH"
+else
+  echo "✓ silero-vad already present: $SILERO_VAD_PATH ($(du -h "$SILERO_VAD_PATH" | cut -f1))"
+fi
+
 echo
 echo "ready:"
-echo "  bin:   $WHISPER_BIN"
-echo "  model: $MODEL_PATH"
+echo "  bin:        $WHISPER_BIN"
+echo "  model:      $MODEL_PATH"
+echo "  silero-vad: $SILERO_VAD_PATH"
