@@ -23,7 +23,7 @@ Recall.ai ships a [reference desktop app](https://github.com/recallai/muesli-pub
 - Auto-detect Zoom / Google Meet / Microsoft Teams via the Recall Desktop SDK — no bots, no calendar scraping
 - Live server-side transcript on those platforms via Recall's first-party `recallai_streaming` provider, with per-participant diarization
 - `⌘⇧R` global hotkey toggles ad-hoc recording from anywhere — works for phone calls, Discord, FaceTime, in-person, anything that makes sound
-- Ad-hoc recordings transcribe **on-device** with `whisper.cpp` (`ggml-medium.bin` by default, multilingual). 3 s sliding window with 1 s overlap; mic and system audio captured as two separate streams labeled `You` / `Other`
+- Ad-hoc recordings transcribe **on-device** with `whisper.cpp` (`ggml-large-v3-turbo.bin` by default — distilled from large-v3, ~99% of SOTA quality at medium-model speed). 3 s sliding window with 1 s overlap, text+time dedup across the overlap; mic and system audio captured as two separate streams labeled `You` / `Other`
 - Comm-app watcher prompts when Discord/FaceTime/WhatsApp/Telegram/Signal/Skype/Webex opens
 - AI summary on recording end, `claude-sonnet-4-6` streaming, with your typed Notes folded into the prompt
 - Everything stored locally in `app.getPath('userData')/meetings.json`
@@ -39,13 +39,13 @@ brew install cmake          # one-time, needed to build whisper-cli from source
 git clone https://github.com/lucas-309/meepcall.git
 cd meepcall
 pnpm install
-pnpm prebuild:assets        # builds the Swift sidecar + whisper-cli, downloads ~1.5 GB model
+pnpm prebuild:assets        # builds the Swift sidecar + whisper-cli, downloads ~1.6 GB model
 cp .env.example .env
 # edit .env — see below
 pnpm dev
 ```
 
-`pnpm prebuild:assets` is required before the first `pnpm dev`. It builds `build/bin/audio-helper` (the ScreenCaptureKit + AVAudioEngine sidecar) and `build/bin/whisper-cli`, and downloads `build/models/ggml-medium.bin` (~1.5 GB) from Hugging Face. Idempotent — re-runs are no-ops once the files are in place.
+`pnpm prebuild:assets` is required before the first `pnpm dev`. It builds `build/bin/audio-helper` (the ScreenCaptureKit + AVAudioEngine sidecar) and `build/bin/whisper-cli`, and downloads `build/models/ggml-large-v3-turbo.bin` (~1.6 GB) from Hugging Face plus `build/models/silero-vad.onnx` (~2.3 MB) from `snakers4/silero-vad`. Idempotent — re-runs are no-ops once the files are in place.
 
 `.env`:
 
@@ -74,23 +74,27 @@ sleep 3 && kill %1
 ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
 ```
 
-Build a DMG with `pnpm build:mac`. Configure your Apple Developer ID in `electron-builder.yml` first if you want it signed and notarized. `electron-builder` auto-codesigns the bundled `audio-helper` and `whisper-cli` binaries from `extraResources`.
+`pnpm dev` for hot-reload development. `pnpm build:mac && pnpm prod` for a packaged app run with stdout/stderr attached to your terminal — useful when you want logs from the production-signed build instead of the dev-mode Electron bundle. ⌃C in the same terminal cleanly quits.
+
+Build a DMG with `pnpm build:mac`. Configure your Apple Developer ID in `electron-builder.yml` first if you want it signed and notarized — without one, electron-builder ad-hoc signs the .app and ships with `hardenedRuntime: false` (needed for the dyld loader to accept ad-hoc signed frameworks; not suitable for distribution outside your machine). `electron-builder` auto-codesigns the bundled `audio-helper`, `whisper-cli`, and ONNX model binaries from `extraResources`.
 
 ### Tunable env vars
 
-- `WHISPER_MODEL` — `ggml-medium.bin` (default), `ggml-small.bin`, `ggml-base.en.bin`, `ggml-large-v3.bin`. Must match what `pnpm fetch:whisper-assets` downloaded (set `WHISPER_MODEL_NAME=…` there).
+- `WHISPER_MODEL` — `ggml-large-v3-turbo.bin` (default), `ggml-medium.bin`, `ggml-small.bin`, `ggml-base.en.bin`, or `ggml-large-v3.bin` (true SOTA but ~3 GB; per-chunk inference often exceeds the 2 s pipeline step on M1/M2, so transcripts fall behind speech). Must match what `pnpm fetch:whisper-assets` downloaded (set `WHISPER_MODEL_NAME=…` there).
 - `WHISPER_LANGUAGE` — `auto` (default, multilingual) or any ISO code (`en`, `es`, `ja`, …) to skip per-chunk detection.
 - `MEEPCALL_NO_SPEECH_THOLD` — `0.6` default; lower (`0.3`–`0.4`) for music, higher (`0.7`–`0.8`) to suppress hallucinations on quiet audio.
+- `MEEPCALL_PHRASE_VAD=1` — opt-in phrase-boundary chunking via silero-vad instead of the fixed sliding window. Cuts at natural speech pauses (1–5 s chunks). Best for pure conversational audio; on continuous music silero correctly identifies non-speech and the chunker falls through to a 5 s max-cap, so music transcription degrades — leave off for mixed voice/music workflows.
 - `MEEPCALL_DEBUG_WHISPER=1` — log every segment whisper produces and what filtered it.
-- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters (overlap-skip still runs).
+- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters.
 - `MEEPCALL_USE_RECALL_FOR_ADHOC=1` — route ad-hoc recordings through Recall's `prepareDesktopAudioRecording` instead of the local engine. Costs Recall credits; useful for A/B-ing transcript quality.
 - `MEEPCALL_COMPARE_MODE=1` — run both engines in parallel on ad-hoc recordings. Local writes to the note as normal; Recall transcripts print to the terminal with `[recall]` tags. Costs Recall credits for the duration.
+- `MEEPCALL_RECALL_LANG` / `MEEPCALL_RECALL_MODE` — per-run override for the `recallai_streaming` provider config. Defaults `en` / `prioritize_low_latency` (the only combo the Desktop SDK supports for Recall's own provider). For multilingual real-time you'd swap the provider to Deepgram or AssemblyAI in `src/main/server.ts`, not just flip these.
 
 ## Usage
 
 **Calendar meetings.** Start your Zoom/Meet/Teams call. Within a few seconds you'll get a macOS notification + a yellow banner in the app. Click Record Meeting. The note opens with a live transcript card (per-participant labels, server-side); on hangup the AI summary streams in below.
 
-**Everything else.** Press `⌘⇧R` to toggle. Or click Record Audio in the header. Or, if Discord/FaceTime/etc. is running, the comm-app banner will offer to record that specific app. All three paths spawn two Swift sidecars per recording — one on the mic, one on the system audio output — and feed both into local whisper.cpp in parallel. Mic segments are labeled `You`, system segments `Other`. Kill background music first; whisper hallucinates lyrics into transcripts otherwise.
+**Everything else.** Press `⌘⇧R` to toggle. Or click Record Audio in the header. Or, if Discord/FaceTime/etc. is running, the comm-app banner will offer to record that specific app. All three paths spawn two Swift sidecars per recording — one on the mic, one on the system audio output — and feed both into local whisper.cpp in parallel. Mic segments are labeled `You`, system segments `Other`. Music in the background gets transcribed too (whisper handles sung lyrics with `♪` markers); fine if that's what you want, mute it if you don't.
 
 **Inside a note.** Title is contenteditable. Type into the Notes card while recording — its contents get folded into the AI summary prompt at end-of-call. Live transcript scrolls itself. AI summary card has a `↻ Regenerate` button. Floating ▣ stops the recording.
 
@@ -98,8 +102,8 @@ Build a DMG with `pnpm build:mac`. Configure your Apple Developer ID in `electro
 
 Two paths, two cost models:
 
-- **Zoom/Meet/Teams (Recall path)** — Recall bills per recording-hour and per transcribed minute. Don't leave it running.
-- **Ad-hoc / phone / Discord / FaceTime (local path)** — free at runtime. whisper.cpp runs on-device. The model download is one-time (~1.5 GB).
+- **Zoom/Meet/Teams (Recall path)** — `$0.50/hr` for the Desktop SDK recording + `$0.15/hr` for `recallai_streaming` transcription = **~$0.65/hr** while a Recall recording is active. Prorated to the second; nothing is billed when the SDK is just listening for meetings or when a banner appears and you ignore it. New Recall accounts come with a few hours of free credits. If you switch the provider in `server.ts` to a third-party (Deepgram, AssemblyAI), the `$0.15/hr` line goes away and you pay that provider directly via your own API key.
+- **Ad-hoc / phone / Discord / FaceTime (local path)** — **$0** at runtime. whisper.cpp + silero-vad run on-device. One-time ~1.6 GB model download.
 
 Anthropic Sonnet 4.6 is ~$3/$15 per million tokens; each summary is roughly 1k in / 500 out, well under a cent.
 
