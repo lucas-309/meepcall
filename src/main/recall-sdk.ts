@@ -138,7 +138,15 @@ export async function initSDK(): Promise<void> {
   })
 
   RecallAiSdk.addEventListener('realtime-event', (evt: RealtimeEvent) => {
-    if (evt.event !== 'video_separate_png.data') {
+    // Suppress noisy event-type-only logs: transcript events get their own
+    // content-bearing log line in processTranscriptData below; video frames
+    // are useless to log at all. Other events (participant joins, etc.) are
+    // useful and stay.
+    const skipLog =
+      evt.event === 'video_separate_png.data' ||
+      evt.event === 'transcript.data' ||
+      evt.event === 'transcript.provider_data'
+    if (!skipLog) {
       log.recall(`Realtime event: ${evt.event}`)
       sdkLogger.logEvent('realtime-event', {
         eventType: evt.event,
