@@ -26,7 +26,21 @@ const PLATFORM_NAMES: Record<string, string> = {
 
 let currentUnknownSpeaker = -1
 
+// Skip Recall init when the user hasn't configured a Recall account. The
+// local engine (audio-helper + whisper) is fully usable without Recall —
+// the only thing missing is the Zoom/Meet/Teams auto-detect banner.
+export function isRecallConfigured(): boolean {
+  return !!(process.env.RECALLAI_API_URL && process.env.RECALLAI_API_KEY)
+}
+
 export async function initSDK(): Promise<void> {
+  if (!isRecallConfigured()) {
+    log.recall(
+      'Recall not configured (RECALLAI_API_URL / RECALLAI_API_KEY unset) — running local-only. ⌘⇧R + Record Audio still work; Zoom/Meet/Teams auto-detect is disabled.'
+    )
+    return
+  }
+
   log.recall('Initializing Recall.ai SDK', { api_url: process.env.RECALLAI_API_URL })
   sdkLogger.logApiCall('init', { api_url: process.env.RECALLAI_API_URL })
 
@@ -426,6 +440,13 @@ export async function joinDetectedMeeting(): Promise<{
 export async function startRecallAdHocRecording(label?: string): Promise<
   { success: true; meetingId: string; recordingId: string } | { success: false; error: string }
 > {
+  if (!isRecallConfigured()) {
+    return {
+      success: false,
+      error: 'Recall not configured — set RECALLAI_API_URL and RECALLAI_API_KEY in .env to use the Recall ad-hoc path'
+    }
+  }
+
   const now = new Date()
   const id = `meeting-${Date.now()}`
   const title =
@@ -519,6 +540,13 @@ export function isCompareModeWindow(windowId: string): boolean {
 }
 
 export async function startCompareModeRecallRecording(): Promise<void> {
+  if (!isRecallConfigured()) {
+    log.warn(
+      'recall',
+      'MEEPCALL_COMPARE_MODE=1 but Recall not configured — skipping shadow Recall recording'
+    )
+    return
+  }
   if (compareModeWindowId) {
     log.warn('recall', 'Compare mode: shadow Recall already active, skipping start')
     return

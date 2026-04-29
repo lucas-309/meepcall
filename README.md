@@ -2,9 +2,11 @@
 
 > macOS meeting + call recorder. Auto-records Zoom/Meet/Teams; one hotkey for everything else.
 
-**meepcall** captures audio from your meetings and calls, streams a live transcript into a local note, and writes an AI summary the moment the call ends. Zoom/Meet/Teams get auto-detected. Phone calls (over iPhone Continuity), Discord, FaceTime, WhatsApp, anything else — `⌘⇧R` from anywhere.
+**meepcall** captures audio from your meetings and calls, streams a live transcript into a local note, and writes an AI summary the moment the call ends. Phone calls (over iPhone Continuity), Discord, FaceTime, WhatsApp, your voice — `⌘⇧R` from anywhere.
 
-It runs on your machine. Notes + transcripts live in your `userData` dir. The only outbound calls are to [Recall.ai](https://recall.ai) (Zoom/Meet/Teams recording + server-side transcription) and [Anthropic](https://anthropic.com) (summary). Ad-hoc recordings transcribe entirely on-device — no audio leaves the machine.
+**Fully local by default, $0 to run.** The recording engine, the transcript (whisper.cpp), and the storage all live on your machine. No account, no API keys required.
+
+[Recall.ai](https://recall.ai) is a thin **optional add-on**: plug a Recall key into `.env` and you also get Zoom / Google Meet / Microsoft Teams auto-detect with per-participant speaker labels. Skip it and the app still records anything with a hotkey — just without the meeting auto-banner. [Anthropic](https://anthropic.com) is the other optional add-on, only used to generate AI summaries on call end.
 
 ```
 Zoom/Meet/Teams  → Recall SDK ─┐
@@ -20,13 +22,15 @@ Recall.ai ships a [reference desktop app](https://github.com/recallai/muesli-pub
 
 ## What it does
 
-- Auto-detect Zoom / Google Meet / Microsoft Teams via the Recall Desktop SDK — no bots, no calendar scraping
-- Live server-side transcript on those platforms via Recall's first-party `recallai_streaming` provider, with per-participant diarization
+**Always on (no keys needed):**
 - `⌘⇧R` global hotkey toggles ad-hoc recording from anywhere — works for phone calls, Discord, FaceTime, in-person, anything that makes sound
-- Ad-hoc recordings transcribe **on-device** with `whisper.cpp` (`ggml-large-v3-turbo.bin` by default — distilled from large-v3, ~99% of SOTA quality at medium-model speed). 3 s sliding window with 1 s overlap, text+time dedup across the overlap; mic and system audio captured as two separate streams labeled `You` / `Other`
+- Recordings transcribe **on-device** with `whisper.cpp` (`ggml-large-v3-turbo.bin` by default — distilled from large-v3, ~99% of SOTA quality at medium-model speed). 3 s sliding window with 1 s overlap, text+time dedup across the overlap; mic and system audio captured as two separate streams labeled `You` / `Other`
 - Comm-app watcher prompts when Discord/FaceTime/WhatsApp/Telegram/Signal/Skype/Webex opens
-- AI summary on recording end, `claude-sonnet-4-6` streaming, with your typed Notes folded into the prompt
 - Everything stored locally in `app.getPath('userData')/meetings.json`
+
+**Optional add-ons (drop-in via `.env`):**
+- *With a Recall key* — auto-detect Zoom / Google Meet / Microsoft Teams (no bots, no calendar scraping) with per-participant diarization via Recall's first-party `recallai_streaming` provider
+- *With an Anthropic key* — AI summary on recording end, `claude-sonnet-4-6` streaming, with your typed Notes folded into the prompt
 
 Roadmap (not in v0.1): voice-activity-triggered record, calendar-triggered record, debug panel.
 
@@ -47,21 +51,23 @@ pnpm install
 #    (~5 min on first run; ~1.6 GB download)
 pnpm prebuild:assets
 
-# 4. Configure API keys
+# 4. Configure (optional — meepcall runs fully local without this step)
 cp .env.example .env
-#    Open .env in your editor and fill in:
-#      - RECALLAI_API_KEY: required for Zoom/Meet/Teams auto-detect.
-#        Sign up at recall.ai — new accounts get a few free hours.
-#      - ANTHROPIC_API_KEY: optional. Only used for AI summaries
-#        on call end. App runs fine without it.
+#    Open .env in your editor. Both keys are OPTIONAL add-ons:
+#      - RECALLAI_API_KEY: enables Zoom/Meet/Teams auto-detect with
+#        per-participant speaker labels. Sign up at recall.ai;
+#        new accounts get a few free hours of credits.
+#      - ANTHROPIC_API_KEY: enables AI summaries on call end.
+#    Skip both and meepcall still records anything via ⌘⇧R, transcribes
+#    locally with whisper, and stores everything on your machine.
 
 # 5. Run
 pnpm dev
 ```
 
-**First launch:** macOS will prompt for **Microphone**, **Screen Recording**, and **Accessibility**. Approve all three, then **quit and relaunch** the app — Accessibility doesn't take effect without a fresh start.
+**First launch:** macOS will prompt for **Microphone** and **Screen Recording**. Approve both. (Plus **Accessibility** if you configured Recall — needed for the meeting auto-detect window watcher.) **Quit and relaunch** the app after granting — TCC doesn't apply mid-session.
 
-**To record anything:** press `⌘⇧R` from anywhere on your machine. Press `⌘⇧R` again to stop. Works for phone calls (over iPhone Continuity), Discord, FaceTime, in-person meetings, your voice — anything that makes sound. The transcript scrolls in as you talk; the AI summary streams in once you stop. Zoom / Google Meet / Microsoft Teams calls additionally show a yellow banner — click **Record Meeting** for per-participant speaker labels via Recall.
+**To record anything:** press `⌘⇧R` from anywhere on your machine. Press `⌘⇧R` again to stop. Works for phone calls (over iPhone Continuity), Discord, FaceTime, in-person meetings, your voice — anything that makes sound. The transcript scrolls in as you talk; if you set an Anthropic key, the AI summary streams in once you stop. With Recall configured, Zoom / Google Meet / Microsoft Teams calls additionally show a yellow banner — click **Record Meeting** for per-participant speaker labels.
 
 That's it.
 
@@ -112,12 +118,11 @@ ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
 
 ## Cost
 
-Two paths, two cost models:
+**Default (no API keys):** **$0**. Recording, transcription, and storage all run on your machine. The only one-time cost is the ~1.6 GB whisper model download.
 
-- **Zoom/Meet/Teams (Recall path)** — `$0.50/hr` for the Desktop SDK recording + `$0.15/hr` for `recallai_streaming` transcription = **~$0.65/hr** while a Recall recording is active. Prorated to the second; nothing is billed when the SDK is just listening for meetings or when a banner appears and you ignore it. New Recall accounts come with a few hours of free credits. If you switch the provider in `server.ts` to a third-party (Deepgram, AssemblyAI), the `$0.15/hr` line goes away and you pay that provider directly via your own API key.
-- **Ad-hoc / phone / Discord / FaceTime (local path)** — **$0** at runtime. whisper.cpp + silero-vad run on-device. One-time ~1.6 GB model download.
+**With Anthropic key:** AI summaries on call end. Sonnet 4.6 is ~$3/$15 per million tokens — each summary is roughly 1k in / 500 out, well under a cent per call.
 
-Anthropic Sonnet 4.6 is ~$3/$15 per million tokens; each summary is roughly 1k in / 500 out, well under a cent.
+**With Recall key:** Zoom/Meet/Teams auto-detect + per-participant speaker labels. `$0.50/hr` for the Desktop SDK recording + `$0.15/hr` for `recallai_streaming` transcription = **~$0.65/hr** while a Recall recording is *active*. Prorated to the second. **Nothing is billed when the SDK is just listening for meetings, when a banner appears and you ignore it, or when you record via ⌘⇧R / the comm-app banner** (those go through the local engine). New Recall accounts come with a few hours of free credits. Swap the provider in `server.ts` to a third-party (Deepgram, AssemblyAI) and the `$0.15/hr` transcription line moves to your own provider account.
 
 ## Note
 
