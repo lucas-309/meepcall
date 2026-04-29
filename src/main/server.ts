@@ -17,14 +17,24 @@ export async function mintUploadToken(): Promise<UploadTokenResponse> {
   }
   log.server(`Minting upload token via ${RECALLAI_API_URL}…`)
 
+  // Per-run overrides for the Recall transcription provider config:
+  //   MEEPCALL_RECALL_LANG (default 'en')        e.g. 'auto', 'es', 'ja'
+  //   MEEPCALL_RECALL_MODE (default 'prioritize_low_latency')
+  //                                              alt: 'prioritize_accuracy'
+  // Note: 'auto' + 'prioritize_low_latency' is invalid (low-latency is en-only).
+  // Pair 'auto' with 'prioritize_accuracy' (transcripts batch every 3-10 min).
+  const recallLang = process.env.MEEPCALL_RECALL_LANG?.trim() || 'en'
+  const recallMode = process.env.MEEPCALL_RECALL_MODE?.trim() || 'prioritize_low_latency'
+  log.server(`Recall provider: recallai_streaming lang=${recallLang} mode=${recallMode}`)
+
   const url = `${RECALLAI_API_URL}/api/v1/sdk_upload/`
   const body = {
     recording_config: {
       transcript: {
         provider: {
           recallai_streaming: {
-            language_code: 'en',
-            mode: 'prioritize_low_latency'
+            language_code: recallLang,
+            mode: recallMode
           }
         }
       },
