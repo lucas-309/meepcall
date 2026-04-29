@@ -165,7 +165,7 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
     const verbose = debugEnabled()
     const noFilters = filtersDisabled()
     if (verbose) {
-      log.recall(
+      log.local(
         `whisper(${source} #${chunkIndex}): ${segs.length} raw segments, skipBeforeMs=${skipBeforeMs}, noFilters=${noFilters}`
       )
     }
@@ -175,19 +175,19 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
       // Skip the overlap region — those audio frames were already covered by
       // the previous chunk and any segments inside them are duplicates.
       if (seg.offsetMs < skipBeforeMs) {
-        if (verbose) log.recall(`  drop[overlap @${seg.offsetMs}ms]: ${seg.text}`)
+        if (verbose) log.local(`  drop[overlap @${seg.offsetMs}ms]: ${seg.text}`)
         continue
       }
       if (!noFilters && isHallucination(seg.text)) {
-        if (verbose) log.recall(`  drop[hallucination]: ${seg.text}`)
+        if (verbose) log.local(`  drop[hallucination]: ${seg.text}`)
         continue
       }
       if (!noFilters && seg.text === lastEntry[source]) {
-        if (verbose) log.recall(`  drop[dedup]: ${seg.text}`)
+        if (verbose) log.local(`  drop[dedup]: ${seg.text}`)
         continue
       }
       lastEntry[source] = seg.text
-      if (verbose) log.recall(`  keep[@${seg.offsetMs}ms]: ${seg.text}`)
+      if (verbose) log.local(`  keep[@${seg.offsetMs}ms]: ${seg.text}`)
       entries.push({
         text: seg.text,
         speaker,

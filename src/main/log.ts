@@ -24,6 +24,8 @@ function timestamp(): string {
 export const log = {
   recall: (...args: unknown[]): void =>
     console.log(timestamp(), tag(C.cyan, '[recall]'), ...args),
+  local: (...args: unknown[]): void =>
+    console.log(timestamp(), tag(C.blue, '[local]'), ...args),
   ai: (...args: unknown[]): void =>
     console.log(timestamp(), tag(C.magenta, '[ai]'), ...args),
   server: (...args: unknown[]): void =>

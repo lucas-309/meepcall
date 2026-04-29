@@ -70,7 +70,7 @@ function fireTranscript(noteId: string, entries: TranscriptEntry[]): void {
     return data
   })
   for (const entry of entries) {
-    log.recall(`Transcript [${entry.speaker}]: ${entry.text}`)
+    log.local(`Transcript [${entry.speaker}]: ${entry.text}`)
   }
 }
 
@@ -88,7 +88,7 @@ function spawnHelper(source: WhisperSource): ChildProcessByStdio<null, Readable,
         if (evt.event === 'error') {
           log.err('audio', `${source} helper: ${evt.code} ${evt.message}`)
         } else if (evt.event === 'starting' || evt.event === 'started' || evt.event === 'stopped') {
-          log.recall(`audio-helper(${source}): ${evt.event}`)
+          log.local(`audio-helper(${source}): ${evt.event}`)
         }
       } catch {
         log.warn('audio', `${source} helper non-json: ${line}`)
@@ -256,7 +256,7 @@ export async function startAdHocRecording(
   { success: true; meetingId: string; recordingId: string } | { success: false; error: string }
 > {
   if (useRecallForAdHoc()) {
-    log.recall('MEEPCALL_USE_RECALL_FOR_ADHOC=1 — routing ad-hoc recording through Recall SDK')
+    log.local('MEEPCALL_USE_RECALL_FOR_ADHOC=1 — routing ad-hoc recording through Recall SDK')
     return startRecallAdHocRecording(label)
   }
 
@@ -267,7 +267,7 @@ export async function startAdHocRecording(
     label?.trim() ||
     `Audio Recording — ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
 
-  log.recall(`Ad-hoc recording: creating note ${id} ("${title}")`)
+  log.local(`Ad-hoc recording: creating note ${id} ("${title}")`)
 
   const data = await readMeetingsData()
   const newMeeting: Meeting = {
@@ -328,7 +328,7 @@ export async function stopManualRecording(
     // No local handle — this might be a Recall-routed ad-hoc recording.
     // The recording-ended event handler will fire runPostRecording.
     if (state.activeMeetingIds[recordingId]) {
-      log.recall(`stopManualRecording: routing to Recall (window=${recordingId.slice(0, 8)}…)`)
+      log.local(`stopManualRecording: routing to Recall (window=${recordingId.slice(0, 8)}…)`)
       return stopRecallRecording(recordingId)
     }
     return { success: false, error: 'Recording not found' }

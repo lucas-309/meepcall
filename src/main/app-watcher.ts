@@ -54,7 +54,7 @@ async function poll(): Promise<void> {
   const next = [...new Set(detected)].sort()
   const same = next.length === last.length && next.every((v, i) => v === last[i])
   if (!same) {
-    log.recall(`Comm apps running: ${next.length === 0 ? '(none)' : next.join(', ')}`)
+    log.local(`Comm apps running: ${next.length === 0 ? '(none)' : next.join(', ')}`)
     sendToRenderer('comm-apps-running', next)
     last = next
   }

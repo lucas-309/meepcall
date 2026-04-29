@@ -22,7 +22,7 @@ async function toggleRecordingFromHotkey(): Promise<void> {
     const [recordingId] = active.sort(
       (a, b) => new Date(b[1].startTime).getTime() - new Date(a[1].startTime).getTime()
     )[0]
-    log.recall(`Hotkey: stopping recording ${recordingId.slice(0, 8)}…`)
+    log.local(`Hotkey: stopping recording ${recordingId.slice(0, 8)}…`)
     new Notification({
       title: 'Recall',
       body: 'Stopping recording…'
@@ -33,7 +33,7 @@ async function toggleRecordingFromHotkey(): Promise<void> {
 
   const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   const label = `Quick recording — ${time}`
-  log.recall(`Hotkey: starting ad-hoc recording "${label}"`)
+  log.local(`Hotkey: starting ad-hoc recording "${label}"`)
   new Notification({
     title: 'Recall',
     body: 'Recording started · Press ⌘⇧R again to stop'
