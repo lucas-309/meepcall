@@ -35,7 +35,6 @@ const STEP_BYTES = STEP_SECONDS * 16000 * 2 // 64,000 — fresh audio per chunk
 const OVERLAP_BYTES = OVERLAP_SECONDS * 16000 * 2 // 32,000 — tail kept around
 const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 96,000 — full chunk fed to whisper
 const STEP_MS = STEP_SECONDS * 1000
-const OVERLAP_MS = OVERLAP_SECONDS * 1000
 
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
@@ -128,8 +127,7 @@ function attachStdoutPipeline(
 
       const idx = ss.chunkIndex++
       const chunkStartMs = idx * STEP_MS
-      const skipBeforeMs = isFirst ? 0 : OVERLAP_MS
-      void flushChunk(source, handle, chunkBuf, idx, chunkStartMs, skipBeforeMs)
+      void flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
     }
   })
 }
@@ -139,8 +137,7 @@ async function flushChunk(
   handle: RecorderHandle,
   pcm: Buffer,
   chunkIndex: number,
-  chunkStartMs: number,
-  skipBeforeMs: number
+  chunkStartMs: number
 ): Promise<void> {
   const wavPath = join(tmpdir(), `meepcall-${handle.recordingId}-${source}-chunk-${chunkIndex}.wav`)
   try {
@@ -154,8 +151,7 @@ async function flushChunk(
       wavPath,
       chunkIndex,
       source,
-      chunkStartMs,
-      skipBeforeMs
+      chunkStartMs
     )
     fireTranscript(handle.noteId, entries)
   } catch (err) {
@@ -168,8 +164,7 @@ async function drainAndFlushFinal(
   handle: RecorderHandle,
   ss: SourceState
 ): Promise<void> {
-  // Tail-only (no fresh audio since last chunk) would emit nothing past the
-  // overlap-skip — bail.
+  // Nothing fresh since the last chunk — bail.
   if (ss.pendingBytes === 0) return
 
   const flat = Buffer.concat(ss.pending, ss.pendingBytes)
@@ -180,9 +175,8 @@ async function drainAndFlushFinal(
 
   const idx = ss.chunkIndex++
   const chunkStartMs = idx * STEP_MS
-  const skipBeforeMs = isFirst ? 0 : OVERLAP_MS
   // Await this final chunk so the transcript is complete before the summary runs.
-  await flushChunk(source, handle, chunkBuf, idx, chunkStartMs, skipBeforeMs)
+  await flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
 }
 
 function startSource(handle: RecorderHandle, source: WhisperSource): SourceState {
