@@ -49,14 +49,42 @@ const OVERLAP_BYTES = OVERLAP_SECONDS * 16000 * 2 // 32,000 — tail kept around
 const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 96,000 — full chunk fed to whisper
 const STEP_MS = STEP_SECONDS * 1000
 
+// Phrase-VAD chunking (MEEPCALL_PHRASE_VAD=1). Cut on natural silence
+// boundaries instead of fixed time slices. Chunks are 1–5 s wide depending on
+// where speech pauses fall.
+const PHRASE_MIN_BYTES = 1 * 16000 * 2 // 1 s — don't emit too-short chunks
+const PHRASE_MAX_BYTES = 5 * 16000 * 2 // 5 s — hard cap if no silence detected
+const PHRASE_SILENCE_END_BYTES = 0.4 * 16000 * 2 // 400 ms of trailing silence = phrase end
+// RMS threshold below which a buffer counts as silence. Int16 max is 32767;
+// real-call ambient noise typically sits around 50–200; speech is 1000+.
+const SILENCE_RMS_THRESHOLD = 250
+
+function usePhraseVad(): boolean {
+  return process.env.MEEPCALL_PHRASE_VAD === '1'
+}
+
+function rmsInt16LE(buf: Buffer): number {
+  const samples = Math.floor(buf.length / 2)
+  if (samples === 0) return 0
+  let sumSq = 0
+  for (let i = 0; i < samples * 2; i += 2) {
+    const s = buf.readInt16LE(i)
+    sumSq += s * s
+  }
+  return Math.sqrt(sumSq / samples)
+}
+
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
   pending: Buffer[]
   pendingBytes: number
   chunkIndex: number
-  // Last OVERLAP_BYTES of the most recently emitted chunk. Prepended to the
-  // next chunk so whisper sees a 3-second window every time.
+  // Sliding-window only: last OVERLAP_BYTES of previous chunk.
   tail: Buffer
+  // Phrase-VAD only: bytes of trailing silence accumulated; absolute audio
+  // start time of the next chunk to emit (ms since recording start).
+  silenceBytes: number
+  chunkStartMs: number
   closed: Promise<void>
 }
 
@@ -115,34 +143,85 @@ function attachStdoutPipeline(
   handle: RecorderHandle,
   ss: SourceState
 ): void {
+  const vad = usePhraseVad()
   ss.proc.stdout.on('data', (chunk: Buffer) => {
-    ss.pending.push(chunk)
-    ss.pendingBytes += chunk.length
-
-    // Emit as many chunks as we have data for. The first chunk needs a full
-    // CHUNK_BYTES of fresh audio (no tail yet); every chunk after that needs
-    // STEP_BYTES of fresh audio and prepends the saved tail.
-    while (true) {
-      const isFirst = ss.chunkIndex === 0
-      const needed = isFirst ? CHUNK_BYTES : STEP_BYTES
-      if (ss.pendingBytes < needed) break
-
-      const flat = Buffer.concat(ss.pending, ss.pendingBytes)
-      const fresh = flat.subarray(0, needed)
-      const chunkBuf = isFirst ? fresh : Buffer.concat([ss.tail, fresh])
-      // Save last OVERLAP_BYTES of this chunk for the next one. Buffer.from
-      // copies so we don't keep the full `flat` alive longer than needed.
-      ss.tail = Buffer.from(chunkBuf.subarray(chunkBuf.length - OVERLAP_BYTES))
-
-      const remainder = flat.subarray(needed)
-      ss.pending = remainder.length > 0 ? [remainder] : []
-      ss.pendingBytes = remainder.length
-
-      const idx = ss.chunkIndex++
-      const chunkStartMs = idx * STEP_MS
-      void flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
-    }
+    if (vad) handlePhraseVadData(chunk, source, handle, ss)
+    else handleSlidingWindowData(chunk, source, handle, ss)
   })
+}
+
+function handleSlidingWindowData(
+  chunk: Buffer,
+  source: WhisperSource,
+  handle: RecorderHandle,
+  ss: SourceState
+): void {
+  ss.pending.push(chunk)
+  ss.pendingBytes += chunk.length
+
+  // Emit as many chunks as we have data for. The first chunk needs a full
+  // CHUNK_BYTES of fresh audio (no tail yet); every chunk after that needs
+  // STEP_BYTES of fresh audio and prepends the saved tail.
+  while (true) {
+    const isFirst = ss.chunkIndex === 0
+    const needed = isFirst ? CHUNK_BYTES : STEP_BYTES
+    if (ss.pendingBytes < needed) break
+
+    const flat = Buffer.concat(ss.pending, ss.pendingBytes)
+    const fresh = flat.subarray(0, needed)
+    const chunkBuf = isFirst ? fresh : Buffer.concat([ss.tail, fresh])
+    // Save last OVERLAP_BYTES of this chunk for the next one. Buffer.from
+    // copies so we don't keep the full `flat` alive longer than needed.
+    ss.tail = Buffer.from(chunkBuf.subarray(chunkBuf.length - OVERLAP_BYTES))
+
+    const remainder = flat.subarray(needed)
+    ss.pending = remainder.length > 0 ? [remainder] : []
+    ss.pendingBytes = remainder.length
+
+    const idx = ss.chunkIndex++
+    const chunkStartMs = idx * STEP_MS
+    void flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
+  }
+}
+
+function handlePhraseVadData(
+  chunk: Buffer,
+  source: WhisperSource,
+  handle: RecorderHandle,
+  ss: SourceState
+): void {
+  ss.pending.push(chunk)
+  ss.pendingBytes += chunk.length
+
+  // Update trailing-silence counter from this incoming buffer's RMS.
+  // Note: chunk size from the helper is typically ~bufferSize (4096 samples
+  // = 8192 bytes = 256 ms at 16 kHz mono Int16), so the silence window is
+  // accurate to ~quarter-second granularity.
+  if (rmsInt16LE(chunk) < SILENCE_RMS_THRESHOLD) {
+    ss.silenceBytes += chunk.length
+  } else {
+    ss.silenceBytes = 0
+  }
+
+  // Cut conditions: hit the hard cap, OR have enough audio AND a trailing
+  // silence period long enough to be a phrase boundary.
+  const hitMax = ss.pendingBytes >= PHRASE_MAX_BYTES
+  const hitPause =
+    ss.pendingBytes >= PHRASE_MIN_BYTES && ss.silenceBytes >= PHRASE_SILENCE_END_BYTES
+
+  if (!hitMax && !hitPause) return
+
+  const chunkBuf = Buffer.concat(ss.pending, ss.pendingBytes)
+  ss.pending = []
+  ss.pendingBytes = 0
+  ss.silenceBytes = 0
+
+  const idx = ss.chunkIndex++
+  const chunkStartMs = ss.chunkStartMs
+  // Each Int16 sample is 2 bytes at 16 kHz → 32 bytes per ms of audio.
+  ss.chunkStartMs += chunkBuf.length / 32
+
+  void flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
 }
 
 async function flushChunk(
@@ -181,13 +260,16 @@ async function drainAndFlushFinal(
   if (ss.pendingBytes === 0) return
 
   const flat = Buffer.concat(ss.pending, ss.pendingBytes)
+  const vad = usePhraseVad()
   const isFirst = ss.chunkIndex === 0
-  const chunkBuf = isFirst ? flat : Buffer.concat([ss.tail, flat])
+  // Phrase-VAD chunks don't overlap, so no tail to prepend.
+  const chunkBuf = vad ? flat : isFirst ? flat : Buffer.concat([ss.tail, flat])
   ss.pending = []
   ss.pendingBytes = 0
 
   const idx = ss.chunkIndex++
-  const chunkStartMs = idx * STEP_MS
+  const chunkStartMs = vad ? ss.chunkStartMs : idx * STEP_MS
+  if (vad) ss.chunkStartMs += chunkBuf.length / 32
   // Await this final chunk so the transcript is complete before the summary runs.
   await flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
 }
@@ -204,6 +286,8 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
     pendingBytes: 0,
     chunkIndex: 0,
     tail: Buffer.alloc(0),
+    silenceBytes: 0,
+    chunkStartMs: 0,
     closed
   }
   attachStdoutPipeline(source, handle, ss)
