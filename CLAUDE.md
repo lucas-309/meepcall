@@ -1,16 +1,21 @@
 # CLAUDE.md — agent-friendly project docs
 
 Personal macOS meeting + call recorder. Electron-vite + TypeScript + React app
-with a **split engine**: Recall.ai's Desktop SDK handles Zoom / Meet / Teams
-meeting auto-detection (it owns the `meeting-detected` event + per-participant
-transcripts on those platforms), and a local Swift sidecar (ScreenCaptureKit +
-AVAudioEngine) feeds chunked **whisper.cpp** transcription for everything else
-(⌘⇧R hotkey, Record Audio button, comm-app banner, in-person, phone calls).
-Anthropic Claude generates the summary on stop. Forked-by-reimplementation from
-Recall's `muesli-public` reference app — same SDK shape, modernized stack.
+with a **split engine**: a local Swift sidecar (ScreenCaptureKit + AVAudioEngine)
+feeds chunked **whisper.cpp** transcription for everything (⌘⇧R hotkey, Record
+Audio button, comm-app banner, in-person, phone calls). Recall.ai's Desktop SDK
+is an **optional add-on** — when configured, it adds Zoom / Meet / Teams
+auto-detection with per-participant labels via `recallai_streaming`. Anthropic
+Claude (also optional) generates the summary on stop. Forked-by-reimplementation
+from Recall's `muesli-public` reference app — same SDK shape, modernized stack.
 
 **Lucas's machine** (`/Users/lucashe309/Developer/meepcall/`). macOS Apple Silicon
 only — every other platform is intentionally out of scope.
+
+The app boots and records fully locally with NO env vars set. `RECALLAI_*` and
+`ANTHROPIC_API_KEY` are optional add-ons; `initSDK` early-returns when Recall
+env vars aren't present (`recall-sdk.ts` `isRecallConfigured()`). Don't add new
+code paths that hard-require Recall.
 
 ---
 
@@ -63,12 +68,21 @@ main process
 ├── recall-sdk.ts          Recall SDK init + meeting-detected listeners +
 │                          createMeetingNoteAndRecord (Zoom/Meet/Teams ONLY)
 ├── audio-capture.ts       local recording engine: spawns two audio-helper
-│                          sidecars per recording (mic + system), chunks every
-│                          5s, drives whisper, fires transcript-updated
+│                          sidecars per recording (mic + system), chunks via
+│                          3s/2s/1s sliding window (or silero-vad phrase
+│                          boundaries when MEEPCALL_PHRASE_VAD=1), drives
+│                          whisper, fires transcript-updated. Also routes
+│                          to Recall ad-hoc / compare modes via env flags.
 ├── audio-helper/          Swift source (ScreenCaptureKit + AVAudioEngine);
-│                          built into build/bin/audio-helper via build.sh
+│                          built into build/bin/audio-helper via build.sh.
+│                          Mic side handles AVAudioEngineConfigurationChange
+│                          to rebuild the tap when AirPods/route change.
+├── silero-vad.ts          onnxruntime-node wrapper around silero-vad.onnx;
+│                          per-source LSTM-stateful frame-by-frame VAD used
+│                          only when MEEPCALL_PHRASE_VAD=1.
 ├── whisper.ts             whisper-cli wrapper. Per-source serial queue,
-│                          hallucination filter, "You" / "Other" labeling.
+│                          hallucination filter (loop detectors), text+time
+│                          dedup ring buffer, "You" / "Other" labeling.
 ├── post-recording.ts      shared "after stop" pipeline (recordingComplete,
 │                          generate summary, fire recording-completed) used
 │                          by both the Recall and the local paths
@@ -165,15 +179,21 @@ recall-sdk.updateNoteWithRecordingInfo OR audio-capture.stopManualRecording
 ```
 ⌘⇧R hotkey OR Record Audio button OR comm-app banner click
   → audio-capture.startAdHocRecording(label)
-    → randomUUID() recordingId; create note in meetings.json
+    → if MEEPCALL_USE_RECALL_FOR_ADHOC=1: route to startRecallAdHocRecording
+    → else: randomUUID() recordingId; create note in meetings.json
     → spawn audio-helper --source mic   (AVAudioEngine → stdout PCM)
     → spawn audio-helper --source system (SCStream     → stdout PCM)
-    → every 5s of stdout per source: write WAV → whisper-cli → entries
+    → 3 s sliding window with 1 s overlap (or silero phrase boundaries
+      when MEEPCALL_PHRASE_VAD=1): write WAV → whisper-cli → entries
+    → text+time dedup against a 3 s ring buffer to suppress overlap dupes
     → entries appended with speaker="You" (mic) or "Other" (system)
     → sendToRenderer('transcript-updated', noteId) per chunk
+    → if MEEPCALL_COMPARE_MODE=1: also start a parallel Recall shadow
+      recording — its transcripts print to terminal only (no note).
   ⌘⇧R again
   → audio-capture.stopManualRecording(recordingId)
     → SIGTERM both helpers → drain residual buffers → final whisper pass
+    → if compare mode: also stop the shadow Recall recording
     → runPostRecording(noteId) (shared with the meeting path above)
 ```
 
@@ -182,27 +202,43 @@ Triggers for the local engine:
 2. `⌘⇧R` global hotkey → toggles record/stop
 3. Comm-app banner (Discord/FaceTime/etc detected) → same button, label changes
 
+**Note-taking + AI summary fold-in**:
+
+```
+NoteEditor.tsx renders a NotesEditor card above the LiveTranscript
+  → user types into a controlled textarea (local state)
+  → 400 ms debounced autosave via updateMeeting → saveMeetingsData IPC
+  → debounced save flushes on blur and on unmount as well
+ai-summary.ts buildUserContent
+  → if meeting.notes is non-empty, prepend a "User's typed notes
+    (HIGH SIGNAL — weight heavily)" block before the transcript
+  → system prompt instructs Claude to prefer notes on factual conflicts
+```
+
 ---
 
 ## Commands
 
 ```bash
-# one-time: build the Swift sidecar + fetch/build whisper-cli + model
-# (requires cmake — `brew install cmake` if missing). ~30s on M-series.
+# one-time: build the Swift sidecar + fetch/build whisper-cli + whisper model
+# + silero-vad ONNX model. (Requires cmake — `brew install cmake` if missing.)
+# ~5 min on first run (1.6 GB whisper download dominates).
 pnpm prebuild:assets
 
-pnpm dev            # electron-vite dev server + Electron window
+pnpm dev            # electron-vite dev server + Electron window (hot reload)
+pnpm prod           # launch dist/mac-arm64/meepcall.app's main exec with
+                    # stdout/stderr attached to terminal — for prod-build logs
 pnpm build          # typecheck + bundle main/preload/renderer
 pnpm build:mac      # prebuild:assets + bundle + electron-builder DMG (macOS)
 pnpm typecheck      # tsc --noEmit on both node + web tsconfigs
 
 # also available individually:
 pnpm build:audio-helper   # swiftc → build/bin/audio-helper
-pnpm fetch:whisper-assets # build/bin/whisper-cli + build/models/ggml-large-v3-turbo.bin
+pnpm fetch:whisper-assets # build/bin/whisper-cli + whisper model + silero-vad
 
-# sanity test the upload-token endpoint (must have pnpm dev running)
+# sanity test the upload-token endpoint (must have pnpm dev running AND Recall
+# env vars set; otherwise this returns an error):
 curl http://localhost:13373/start-recording
-# → {"status":"success","upload_token":"..."}
 
 # sanity test the audio-helper in isolation (mic mode for 3s):
 ./build/bin/audio-helper --source mic > /tmp/mic.raw 2> /tmp/mic.err &
@@ -217,29 +253,64 @@ ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
 
 ## Env vars
 
+All env vars are optional. The app boots and records fully locally with
+nothing set.
+
 `.env` (gitignored):
 
 ```
+# Recall.ai (optional add-on) — Zoom/Meet/Teams auto-detect with
+# per-participant labels. Both URL + KEY must be set together.
 RECALLAI_API_URL=https://us-west-2.recall.ai   # see region notes above
 RECALLAI_API_KEY=<recall key — must match URL region>
+
+# Anthropic (optional add-on) — AI summaries on call end.
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-`.env.example` is committed with placeholders. **Never commit .env.** If the
-user pastes keys into a chat, tell them to rotate.
+`.env.example` is committed with placeholders, `RECALLAI_API_URL` deliberately
+left blank. **Never commit .env.** If the user pastes keys into a chat, tell
+them to rotate.
 
-App boots successfully without `ANTHROPIC_API_KEY` (lazy init in `ai-summary.ts`).
-Summary calls throw with a clear error if the key is missing — the rest of the
-app works without it.
+Behavior with missing keys:
+- No `RECALLAI_*` → `initSDK` skips `RecallAiSdk.init`, no meeting auto-detect,
+  no banner. ⌘⇧R / Record Audio still work end-to-end via the local engine.
+- No `ANTHROPIC_API_KEY` → app boots fine (lazy init in `ai-summary.ts`).
+  `Generate AI Summary` calls throw with a clear error.
+
+### Tunable runtime flags (also env vars)
+
+- `WHISPER_MODEL` — `ggml-large-v3-turbo.bin` (default), or any other whisper.cpp
+  model name in `build/models/`. Keep matched to `WHISPER_MODEL_NAME` for the
+  fetch script.
+- `WHISPER_LANGUAGE` — `auto` (default, multilingual) or ISO code.
+- `MEEPCALL_NO_SPEECH_THOLD` — `0.6` default; lower for music, higher for
+  silence-tolerant speech.
+- `MEEPCALL_PHRASE_VAD=1` — opt-in chunker that uses silero-vad for natural
+  phrase-boundary chunks (1–5 s). Off by default because silero correctly
+  flags music as non-speech, which is the wrong call for music transcription.
+- `MEEPCALL_DEBUG_WHISPER=1` — log every whisper segment + filter decision.
+- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters.
+- `MEEPCALL_USE_RECALL_FOR_ADHOC=1` — route ⌘⇧R / Record Audio through
+  `RecallAiSdk.prepareDesktopAudioRecording` instead of the local engine.
+  Costs Recall credits.
+- `MEEPCALL_COMPARE_MODE=1` — local + shadow Recall recording in parallel.
+  Local writes the note as normal; Recall transcripts print to terminal only.
+- `MEEPCALL_RECALL_LANG` / `MEEPCALL_RECALL_MODE` — per-run override for the
+  `recallai_streaming` provider config. Defaults `en` + `prioritize_low_latency`
+  (the only combo Desktop SDK supports for Recall's own provider).
 
 ---
 
 ## Conventions
 
-- **Logger**: use `log.recall(...)` / `log.server(...)` / `log.ai(...)` /
-  `log.ok(tag, ...)` / `log.warn(tag, ...)` / `log.err(tag, ...)` from
-  `src/main/log.ts`. Don't add raw `console.log` to main process — it bypasses
-  the timestamp + tag formatting.
+- **Logger**: use `log.recall(...)` / `log.local(...)` / `log.server(...)` /
+  `log.ai(...)` / `log.ok(tag, ...)` / `log.warn(tag, ...)` / `log.err(tag, ...)`
+  from `src/main/log.ts`. **`log.recall` is reserved for actual Recall.ai SDK
+  events**; the local Swift + whisper pipeline uses `log.local` (blue tag).
+  Reading the terminal: `[recall]` = Recall SDK, `[local]` = local engine.
+  Don't add raw `console.log` to main process — it bypasses the timestamp +
+  tag formatting.
 
 - **IPC channels**: lowercase-kebab-case (`meeting-detection-status`,
   `transcript-updated`, `comm-apps-running`). Match Muesli's naming where it
@@ -300,11 +371,17 @@ app works without it.
    instead of creating a duplicate. Don't remove this — both Muesli's
    notification click handler AND the in-app button can fire.
 
-9. **whisper.cpp hallucinations on silence.** `base.en` regularly emits
-   `"Thank you."`, `"Thanks for watching."`, or `"you"` on silent chunks. We
-   filter those in `whisper.ts` (regex + same-as-previous dedup) and pass
-   `--no-speech-thold 0.6` to the binary. If a real utterance happens to match
-   the filter regex, it gets dropped — accept it for v1.
+9. **whisper.cpp hallucinations on silence/music.** Three known patterns:
+   (a) prior-leak ghost lines — `"Thank you."`, `"Thanks for watching."`, `"you"`,
+   bracketed annotations like `[BLANK_AUDIO]`, `[Music]`. Caught by `HALLUCINATION_RE`.
+   (b) char-loop loops — same char repeated 10+ times in a row (Sinhala
+   `වවවවවවවවවව`, `eeeeeeeeee`). Caught by `CHAR_LOOP_RE`.
+   (c) token-loop loops — short token repeated 6+ times (`ʔ ʔ ʔ ʔ ʔ ʔ`).
+   Caught by `TOKEN_LOOP_RE`.
+   Thresholds are deliberately tuned to NOT catch song lyric patterns
+   ("yeahhhhh", "no no no no"). Plus a 3-second-window text+time dedup ring
+   buffer in `createWhisperSession` to suppress duplicate emissions caused
+   by sliding-window overlap. `MEEPCALL_DEBUG_WHISPER=1` shows every drop.
 
 10. **Two audio-helper child processes per recording.** Mic and system audio
     are captured by separate sidecars so we can label transcript entries
@@ -313,10 +390,37 @@ app works without it.
     before triggering the AI summary.
 
 11. **`extraResources` in `electron-builder.yml`** copies `audio-helper`,
-    `whisper-cli`, and `ggml-large-v3-turbo.bin` into `meepcall.app/Contents/Resources/`.
-    `electron-builder` auto-codesigns Mach-O binaries it finds there using the
-    inherited entitlements. If you add another helper, add it to `extraResources`
-    AND verify with `codesign -dvv` after `pnpm build:mac`.
+    `whisper-cli`, `ggml-large-v3-turbo.bin`, and `silero-vad.onnx` into
+    `meepcall.app/Contents/Resources/`. `electron-builder` auto-codesigns
+    Mach-O binaries it finds there. If you add another helper or model, add
+    it to `extraResources` AND verify with `codesign -dvv` after `pnpm build:mac`.
+
+12. **`hardenedRuntime: false` in `electron-builder.yml`.** Without an Apple
+    Developer ID, electron-builder ad-hoc signs both the .app and the bundled
+    Electron Framework, but their adhoc identities aren't recognized as
+    matching by macOS Sequoia's hardened-runtime loader (`mapping process and
+    mapped file (non-platform) have different Team IDs`). Disabling hardened
+    runtime is fine for personal use; **don't flip it back on without a real
+    Developer ID** or the prod app will crash at launch with EXC_CRASH.
+
+13. **AirPods / device route changes.** `AudioHelper.swift`'s `MicCapture`
+    subscribes to `AVAudioEngineConfigurationChange`. On notification, it
+    tears down the stale tap+converter and rebuilds from the new device's
+    input format with up to 5×200 ms retries (sample-rate transitions can
+    leave the input at `0` for ~100 ms). The system source uses SCStream and
+    is independent of input route changes.
+
+14. **FaceTime audio is protected by macOS.** Apple deliberately excludes
+    FaceTime's audio output from ScreenCaptureKit captures. Even with all
+    permissions granted, FaceTime calls won't transcribe — neither side.
+    Use Discord/Zoom/Meet/iPhone-Continuity calls instead. (BlackHole virtual
+    audio device is a workaround if a user really needs it.)
+
+15. **Recall ad-hoc speaker labels are `Host`/`Guest`, not real names.** The
+    `recallai_streaming` provider only knows participant names when it has
+    a meeting platform context. `prepareDesktopAudioRecording` sessions are
+    anonymous, so transcripts come back tagged `Host` (mic) and `Guest`
+    (system). Documented in the SDK docs; not a bug.
 
 ---
 
@@ -336,10 +440,12 @@ Explicitly **not** going to do:
 - Auto-update (`electron-updater` isn't a dep)
 - Tests / CI
 - Per-user account system
-- Alternate transcription providers in the UI. The meeting path uses
-  `recallai_streaming` (`server.ts`); the ad-hoc path uses local whisper.cpp
-  (`whisper.ts` → `whisper-cli` with `ggml-large-v3-turbo.bin`). Swap there if you
-  want a different provider.
+- Provider-picker UI. The meeting path uses `recallai_streaming` (`server.ts`)
+  — env-var override via `MEEPCALL_RECALL_LANG` / `MEEPCALL_RECALL_MODE`,
+  or edit `server.ts` to swap to `deepgram_streaming` / `assembly_ai_v3_streaming`.
+  The ad-hoc path uses local whisper.cpp by default (`whisper.ts` → `whisper-cli`
+  with `ggml-large-v3-turbo.bin`); flip `MEEPCALL_USE_RECALL_FOR_ADHOC=1` to
+  route through Recall instead.
 
 ---
 
@@ -355,14 +461,25 @@ Explicitly **not** going to do:
 
 Last verified against:
 - `src/main/index.ts` — global hotkey `⌘⇧R`, audio-helper teardown on quit
-- `src/main/recall-sdk.ts` — meeting-detected flow ONLY (ad-hoc moved out)
-- `src/main/audio-capture.ts` — local recording engine (Swift sidecar + chunks)
-- `src/main/whisper.ts` — whisper-cli wrapper, hallucination filter, mic/system
+- `src/main/recall-sdk.ts` — `isRecallConfigured()` guard, meeting-detected flow,
+  Recall ad-hoc + compare-mode entry points, `MEEPCALL_RECALL_*` overrides
+- `src/main/audio-capture.ts` — local recording engine, sliding-window chunker,
+  silero-vad opt-in, ad-hoc / compare flag dispatching
+- `src/main/silero-vad.ts` — onnxruntime-node wrapper for silero VAD
+- `src/main/whisper.ts` — whisper-cli wrapper, hallucination + dedup, debug knobs
 - `src/main/post-recording.ts` — shared "after stop" pipeline
-- `src/main/audio-helper/AudioHelper.swift` — ScreenCaptureKit + AVAudioEngine
-- `src/main/ai-summary.ts` — Anthropic SDK direct, claude-sonnet-4-6 streaming
-- `src/main/server.ts` — `recallai_streaming` provider for meeting path, `Token` auth
-- `src/renderer/src/pages/NoteEditor.tsx` — LiveTranscript + AISummary cards
+- `src/main/audio-helper/AudioHelper.swift` — ScreenCaptureKit + AVAudioEngine,
+  AVAudioEngineConfigurationChange handling for AirPods/route swaps
+- `src/main/ai-summary.ts` — Anthropic SDK direct, claude-sonnet-4-6 streaming,
+  notes-folded-into-prompt
+- `src/main/server.ts` — `recallai_streaming` provider for meeting path,
+  `Token` auth, `MEEPCALL_RECALL_*` env overrides
+- `src/main/log.ts` — `[recall]` vs `[local]` tag split
+- `src/renderer/src/pages/NoteEditor.tsx` — NotesEditor + LiveTranscript + AISummary
 - `src/renderer/src/components/Header.tsx` — comm-app-aware Record Audio button
+- `electron-builder.yml` — `hardenedRuntime: false`, `extraResources` model list
+- `package.json` — `pnpm prod` script, `onnxruntime-node` dep
 
 If you change those files in ways that break these claims, update this doc.
+
+`AGENTS.md` is a symlink to this file — keep them aligned.
