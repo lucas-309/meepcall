@@ -37,6 +37,30 @@ const LANGUAGE = process.env.WHISPER_LANGUAGE?.trim() || 'auto'
 // singing has different acoustic features than speech. Higher (0.7-0.8)
 // suppresses more hallucinations on quiet/noisy audio.
 const NO_SPEECH_THOLD = process.env.MEEPCALL_NO_SPEECH_THOLD?.trim() || '0.6'
+
+// Allowed-language filter. whisper auto-detect occasionally flips to the
+// wrong language on a noisy chunk (Mandarin → Japanese, English → German),
+// producing nonsense. Default `en,zh` matches the common bilingual case.
+// Set MEEPCALL_WHISPER_LANGS=auto (or empty) to accept any language. List
+// is comma-separated ISO codes: en,zh,ja,ko,es,fr,de,ru,ar,hi,pt,it,vi,th
+// (anything whisper supports).
+const ALLOWED_LANGS: Set<string> | null = (() => {
+  const raw = (process.env.MEEPCALL_WHISPER_LANGS ?? 'en,zh').trim().toLowerCase()
+  if (raw === 'auto' || raw === '') return null
+  const set = new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  )
+  return set.size > 0 ? set : null
+})()
+
+// How much of the recent transcript to feed back to whisper as `--prompt`.
+// whisper.cpp's prompt context is ~224 tokens; ~200 chars covers ~50 Chinese
+// chars or ~30 English words — enough for language-continuity + name/term
+// continuity without crowding the decoder. Held per-source in the session.
+const PROMPT_CHARS_MAX = 200
 // Whisper hallucinations on silence / noise: bracketed annotations
 // ([BLANK_AUDIO], [Music]), parenthesized stage directions ((music),
 // (speaking in foreign language)), and a few classic ghost lines.
@@ -76,6 +100,7 @@ function isHallucination(text: string): boolean {
 }
 
 interface WhisperJSON {
+  result?: { language?: string }
   transcription?: Array<{
     text?: string
     offsets?: { from?: number; to?: number }
@@ -87,11 +112,19 @@ interface SegmentInternal {
   offsetMs: number
 }
 
-async function runWhisperCli(wavPath: string, jsonPath: string): Promise<SegmentInternal[]> {
+type WhisperRunResult =
+  | { ok: true; segs: SegmentInternal[]; detectedLang: string }
+  | { ok: false; reason: string }
+
+async function runWhisperCliOnce(
+  wavPath: string,
+  jsonPath: string,
+  prompt: string
+): Promise<WhisperRunResult> {
   const bin = resolveBinPath('whisper-cli')
   const model = resolveModelPath(MODEL_NAME)
 
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const args = [
       '-m',
       model,
@@ -108,35 +141,73 @@ async function runWhisperCli(wavPath: string, jsonPath: string): Promise<Segment
       '--threads',
       '4'
     ]
+    // `--prompt` biases the decoder toward content + language similar to
+    // the prompt without forcing it. Empty prompt = no bias (first chunk).
+    if (prompt) {
+      args.push('--prompt', prompt)
+    }
     const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
     let stderr = ''
     proc.stderr.on('data', (d) => {
       stderr += d.toString()
     })
-    proc.on('error', reject)
+    proc.on('error', (err) => resolve({ ok: false, reason: `spawn: ${err.message}` }))
     proc.on('close', async (code) => {
       if (code !== 0) {
-        log.warn('audio', `whisper-cli exited ${code}: ${stderr.slice(0, 400)}`)
-        resolve([])
+        resolve({ ok: false, reason: `exit ${code}: ${stderr.slice(0, 400)}` })
         return
       }
       try {
         const fullPath = jsonPath.endsWith('.json') ? jsonPath : `${jsonPath}.json`
         const raw = await fsp.readFile(fullPath, 'utf8')
         const parsed = JSON.parse(raw) as WhisperJSON
+        // Language filter: drop the chunk if whisper's auto-detected
+        // language isn't in the allow list. Better to lose a beat than
+        // emit garbled cross-language transliteration. Skip the filter
+        // when LANGUAGE is pinned (user already constrained whisper).
+        const detected = (parsed.result?.language ?? '').toLowerCase()
+        if (
+          ALLOWED_LANGS &&
+          LANGUAGE === 'auto' &&
+          detected &&
+          !ALLOWED_LANGS.has(detected)
+        ) {
+          if (debugEnabled()) {
+            log.local(`whisper: dropping chunk, detected lang=${detected} not in allow list`)
+          }
+          resolve({ ok: true, segs: [], detectedLang: detected })
+          return
+        }
         const out: SegmentInternal[] = []
         for (const seg of parsed.transcription ?? []) {
           const text = (seg.text ?? '').trim()
           if (!text) continue
           out.push({ text, offsetMs: seg.offsets?.from ?? 0 })
         }
-        resolve(out)
+        resolve({ ok: true, segs: out, detectedLang: detected })
       } catch (err) {
-        log.warn('audio', `whisper-cli json parse failed: ${(err as Error).message}`)
-        resolve([])
+        resolve({ ok: false, reason: `parse: ${(err as Error).message}` })
       }
     })
   })
+}
+
+// One retry budget. whisper-cli crashes (non-zero exit, spawn error, malformed
+// JSON) are usually transient — a second pass on the same WAV is cheap and
+// salvages the chunk. After 2 attempts, give up and return [] so the pipeline
+// keeps moving.
+async function runWhisperCli(
+  wavPath: string,
+  jsonPath: string,
+  prompt: string
+): Promise<{ segs: SegmentInternal[]; detectedLang: string }> {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const r = await runWhisperCliOnce(wavPath, jsonPath, prompt)
+    if (r.ok) return { segs: r.segs, detectedLang: r.detectedLang }
+    const tag = attempt < 2 ? 'retrying' : 'gave up'
+    log.warn('audio', `whisper-cli ${tag} (${attempt}/2): ${r.reason}`)
+  }
+  return { segs: [], detectedLang: '' }
 }
 
 // How long an emitted segment stays in the dedup ring buffer (audio-time ms).
@@ -157,7 +228,69 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
     mic: [],
     system: []
   }
+  // Per-source language continuity. People rarely flip languages chunk-by-
+  // chunk — when whisper auto-detects a one-off outlier (Portuguese inside
+  // a Chinese stream, English hallucinated on top of Mandarin music), it's
+  // almost always wrong. Hysteresis: lock onto the first detected language;
+  // accept a switch only after seeing the new language twice in a row.
+  // Established stream + single outlier → drop the chunk silently.
+  interface LangState {
+    current: string | null
+    pendingLang: string | null
+    pendingCount: number
+  }
+  const langState: Record<WhisperSource, LangState> = {
+    mic: { current: null, pendingLang: null, pendingCount: 0 },
+    system: { current: null, pendingLang: null, pendingCount: 0 }
+  }
+  function checkContinuity(source: WhisperSource, detected: string): boolean {
+    if (!detected) return true
+    const s = langState[source]
+    if (s.current === null) {
+      s.current = detected
+      return true
+    }
+    if (detected === s.current) {
+      s.pendingLang = null
+      s.pendingCount = 0
+      return true
+    }
+    if (s.pendingLang === detected) {
+      s.pendingCount++
+    } else {
+      s.pendingLang = detected
+      s.pendingCount = 1
+    }
+    if (s.pendingCount >= 2) {
+      s.current = detected
+      s.pendingLang = null
+      s.pendingCount = 0
+      return true
+    }
+    if (debugEnabled()) {
+      log.local(
+        `whisper(${source}): outlier lang=${detected} (current=${s.current}), drop chunk`
+      )
+    }
+    return false
+  }
   let destroyed = false
+
+  // Build a continuity prompt from recent emissions for this source. Joining
+  // the most recent texts back-to-front and trimming to PROMPT_CHARS_MAX keeps
+  // the freshest context closest to the new chunk. Same source only — mic and
+  // system are independent speakers, mixing prompts would confuse whisper.
+  function buildPrompt(source: WhisperSource): string {
+    const arr = recent[source]
+    if (arr.length === 0) return ''
+    let acc = ''
+    for (let i = arr.length - 1; i >= 0; i--) {
+      const next = arr[i].text + (acc ? ' ' + acc : '')
+      if (next.length > PROMPT_CHARS_MAX) break
+      acc = next
+    }
+    return acc
+  }
 
   async function transcribeChunk(
     wavPath: string,
@@ -168,11 +301,19 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
     if (destroyed) return []
     const speaker = source === 'mic' ? 'You' : 'Other'
     const jsonBase = join(tmpdir(), `meepcall-${recordingId}-${source}-chunk-${chunkIndex}`)
-    const segs = await runWhisperCli(wavPath, jsonBase)
+    const prompt = buildPrompt(source)
+    const { segs, detectedLang } = await runWhisperCli(wavPath, jsonBase, prompt)
 
     // Cleanup temp files.
     void fsp.unlink(`${jsonBase}.json`).catch(() => {})
     void fsp.unlink(wavPath).catch(() => {})
+
+    // Continuity filter — only when in auto mode and we got actual segments.
+    // Empty chunks tell us nothing about the stream's language so we don't
+    // let them advance/disturb the lang state.
+    if (LANGUAGE === 'auto' && segs.length > 0 && !checkContinuity(source, detectedLang)) {
+      return []
+    }
 
     const verbose = debugEnabled()
     const noFilters = filtersDisabled()
