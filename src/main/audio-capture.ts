@@ -66,6 +66,11 @@ function usePhraseVad(): boolean {
   return process.env.MEEPCALL_PHRASE_VAD === '1'
 }
 
+// If a helper's heartbeat shows 0 samplesWritten this many ms after the
+// 'started' event, log a warning ONCE so the user sees their system source
+// is silent. The most common cause is missing Screen Recording permission.
+const SILENT_SOURCE_WARN_MS = 5000
+
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
   pending: Buffer[]
@@ -115,6 +120,11 @@ function spawnHelper(source: WhisperSource): ChildProcessByStdio<null, Readable,
   const proc = spawn(bin, ['--source', source], {
     stdio: ['ignore', 'pipe', 'pipe']
   })
+  let lastSamples = 0
+  let firstSamplesLogged = false
+  let silenceWarned = false
+  let silenceTimer: NodeJS.Timeout | null = null
+
   proc.stderr.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim()
     if (!text) return
@@ -123,13 +133,50 @@ function spawnHelper(source: WhisperSource): ChildProcessByStdio<null, Readable,
         const evt = JSON.parse(line)
         if (evt.event === 'error') {
           log.err('audio', `${source} helper: ${evt.code} ${evt.message}`)
-        } else if (evt.event === 'starting' || evt.event === 'started' || evt.event === 'stopped') {
+        } else if (evt.event === 'starting' || evt.event === 'stopped') {
+          log.local(`audio-helper(${source}): ${evt.event}`)
+        } else if (evt.event === 'started') {
+          log.local(`audio-helper(${source}): started`)
+          // If no samples after SILENT_SOURCE_WARN_MS, the source is dead.
+          // For system audio, that's almost always a missing Screen
+          // Recording permission — the SCStream "starts" cleanly but
+          // produces only silence. Tell the user directly so they don't
+          // have to read source code to figure it out.
+          silenceTimer = setTimeout(() => {
+            if (!silenceWarned && lastSamples === 0) {
+              silenceWarned = true
+              if (source === 'system') {
+                log.warn(
+                  'audio',
+                  'system audio is producing 0 samples — grant Screen Recording permission in System Settings → Privacy & Security → Screen & System Audio Recording, then restart meepcall. Until then "Other" labels will be empty and mic will catch speaker bleed as "You".'
+                )
+              } else {
+                log.warn(
+                  'audio',
+                  'mic is producing 0 samples — check Microphone permission or input device.'
+                )
+              }
+            }
+          }, SILENT_SOURCE_WARN_MS)
+        } else if (evt.event === 'heartbeat') {
+          lastSamples = typeof evt.samplesWritten === 'number' ? evt.samplesWritten : lastSamples
+          // One-shot confirmation that audio is actually flowing for this
+          // source. Non-spammy: fires once per recording when the first
+          // non-zero heartbeat lands.
+          if (!firstSamplesLogged && lastSamples > 0) {
+            firstSamplesLogged = true
+            log.local(`audio-helper(${source}): receiving audio (${lastSamples} samples so far)`)
+          }
+        } else if (evt.event === 'route_change' || evt.event === 'route_recovered') {
           log.local(`audio-helper(${source}): ${evt.event}`)
         }
       } catch {
         log.warn('audio', `${source} helper non-json: ${line}`)
       }
     }
+  })
+  proc.on('close', () => {
+    if (silenceTimer) clearTimeout(silenceTimer)
   })
   return proc
 }
