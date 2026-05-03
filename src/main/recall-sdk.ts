@@ -16,6 +16,7 @@ import { readMeetingsData, scheduleOperation, writeMeetingsData } from './storag
 import { mintUploadToken } from './server'
 import { createWindow, focusMainWindow, getMainWindow, sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
+import { queueTranslation } from './translator'
 
 const PLATFORM_NAMES: Record<string, string> = {
   zoom: 'Zoom',
@@ -245,14 +246,16 @@ async function processTranscriptData(evt: RealtimeEvent): Promise<void> {
   }
   const noteId = tracking.noteId
 
+  const entry = { text, speaker, timestamp: new Date().toISOString() }
   await scheduleOperation((data) => {
     const meeting = data.pastMeetings.find((m) => m.id === noteId)
     if (!meeting) return null
     if (!meeting.transcript) meeting.transcript = []
-    meeting.transcript.push({ text, speaker, timestamp: new Date().toISOString() })
+    meeting.transcript.push(entry)
     sendToRenderer('transcript-updated', noteId)
     return data
   })
+  queueTranslation(noteId, entry)
 }
 
 async function processParticipantJoin(evt: RealtimeEvent): Promise<void> {
