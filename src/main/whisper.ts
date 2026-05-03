@@ -316,13 +316,6 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
     void fsp.unlink(`${jsonBase}.json`).catch(() => {})
     void fsp.unlink(wavPath).catch(() => {})
 
-    // Continuity filter — only when in auto mode and we got actual segments.
-    // Empty chunks tell us nothing about the stream's language so we don't
-    // let them advance/disturb the lang state.
-    if (LANGUAGE === 'auto' && segs.length > 0 && !checkContinuity(source, detectedLang)) {
-      return []
-    }
-
     const verbose = debugEnabled()
     const noFilters = filtersDisabled()
     if (verbose) {
@@ -331,18 +324,33 @@ export function createWhisperSession(recordingId: string, startedAt: number): Wh
       )
     }
 
+    // Pre-filter hallucinations BEFORE the continuity check. A chunk that's
+    // pure noise (¶¶¶¶¶, [Music], char loops) shouldn't update the language
+    // state machine — whisper's detected language on garbage is meaningless
+    // and feeding it into continuity can lock the stream onto the wrong
+    // language for real audio that follows.
+    const realSegs = noFilters
+      ? segs
+      : segs.filter((s) => {
+          if (isHallucination(s.text)) {
+            if (verbose) log.local(`  drop[hallucination]: ${s.text}`)
+            return false
+          }
+          return true
+        })
+
+    // Continuity filter — only when in auto mode and we have real segments.
+    if (LANGUAGE === 'auto' && realSegs.length > 0 && !checkContinuity(source, detectedLang)) {
+      return []
+    }
+
     // GC entries older than the dedup window relative to this chunk.
     const chunkEndMs = chunkStartMs + 3000
     recent[source] = recent[source].filter((e) => chunkEndMs - e.absMs < DEDUP_WINDOW_MS)
 
     const entries: TranscriptEntry[] = []
-    for (const seg of segs) {
+    for (const seg of realSegs) {
       const segAbsMs = chunkStartMs + seg.offsetMs
-
-      if (!noFilters && isHallucination(seg.text)) {
-        if (verbose) log.local(`  drop[hallucination]: ${seg.text}`)
-        continue
-      }
       // Dedup against recently-emitted segments with matching text, within
       // the overlap window. This is what catches the duplicate emissions
       // of the same audio across overlapping chunks — superior to skipping
