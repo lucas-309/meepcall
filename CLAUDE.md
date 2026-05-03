@@ -278,6 +278,26 @@ Behavior with missing keys:
 - No `ANTHROPIC_API_KEY` → app boots fine (lazy init in `ai-summary.ts`).
   `Generate AI Summary` calls throw with a clear error.
 
+### Always-on diagnostics (no env flag needed)
+
+`pnpm dev` already prints enough to diagnose the common pipeline failures
+without flipping anything:
+- `audio-helper(mic|system): receiving audio (N samples so far)` fires once
+  per source on its first non-zero heartbeat. No log = that source is dead.
+- `audio-helper(mic|system): route_change` / `route_recovered` on AirPods
+  swaps so you can see the mic helper rebuilt its tap.
+- After 5 s of silence, a one-shot `[audio]` warn names the likely cause —
+  Screen Recording permission for system audio, mic permission for mic.
+  This is the canonical "everything is labeled You" debug signal.
+- `whisper-cli retrying (1/2): <reason>` / `gave up (2/2)` on chunk crashes.
+- `Transcript [You|Other]: <text>` per emitted entry.
+
+If you need deeper introspection, flip a knob:
+- `MEEPCALL_DEBUG_WHISPER=1` — log every segment whisper produces and which
+  filter (if any) dropped it.
+- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters
+  entirely. Overlap-skip still runs (correctness, not heuristic).
+
 ### Tunable runtime flags (also env vars)
 
 - `WHISPER_MODEL` — `ggml-large-v3-turbo.bin` (default), or any other whisper.cpp
@@ -289,8 +309,6 @@ Behavior with missing keys:
 - `MEEPCALL_PHRASE_VAD=1` — opt-in chunker that uses silero-vad for natural
   phrase-boundary chunks (1–5 s). Off by default because silero correctly
   flags music as non-speech, which is the wrong call for music transcription.
-- `MEEPCALL_DEBUG_WHISPER=1` — log every whisper segment + filter decision.
-- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters.
 - `MEEPCALL_USE_RECALL_FOR_ADHOC=1` — route ⌘⇧R / Record Audio through
   `RecallAiSdk.prepareDesktopAudioRecording` instead of the local engine.
   Costs Recall credits.
