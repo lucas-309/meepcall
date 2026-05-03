@@ -274,6 +274,12 @@ function LiveTranscript({
               >
                 <div className="transcript-speaker">{e.speaker}</div>
                 <div className="transcript-text">{e.text}</div>
+                {e.translation && (
+                  <div className="transcript-translation">
+                    <span className="transcript-translation-label">EN</span>
+                    {e.translation}
+                  </div>
+                )}
               </div>
             )
           })
