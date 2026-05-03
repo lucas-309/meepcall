@@ -73,6 +73,13 @@ const HALLUCINATION_RE =
 // "yeahhhhhhh" (~7 chars) — keep the threshold above that.
 const CHAR_LOOP_RE = /(.)\1{9,}/
 
+// Symbol-only repetition: a non-letter/non-digit/non-whitespace character
+// repeated 5+ times. Real language never does this (the longest natural
+// run is "...." for emphatic ellipsis at 4). Whisper hallucinates symbol
+// soup on noise: ¶¶¶¶¶, •••••, █████, ▮▮▮▮▮. Threshold tighter than
+// CHAR_LOOP_RE because there's no song-lyric carve-out to worry about.
+const SYMBOL_LOOP_RE = /([^\p{L}\p{N}\s])\1{4,}/u
+
 // Decoder token-loop: a short token (1–4 chars) repeated 6+ times separated
 // by whitespace. Catches "ʔ ʔ ʔ ʔ ʔ ʔ", "the the the the the the". Songs
 // commonly do "no no no no" (4×) and "yeah yeah yeah yeah" (4×) — keep the
@@ -95,6 +102,7 @@ function filtersDisabled(): boolean {
 function isHallucination(text: string): boolean {
   if (HALLUCINATION_RE.test(text)) return true
   if (CHAR_LOOP_RE.test(text)) return true
+  if (SYMBOL_LOOP_RE.test(text)) return true
   if (TOKEN_LOOP_RE.test(text)) return true
   return false
 }
