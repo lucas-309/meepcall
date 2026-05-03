@@ -13,6 +13,7 @@ import { createSileroVad, FRAME_DURATION_MS, type SileroVad } from './silero-vad
 import { createWhisperSession, type WhisperSession, type WhisperSource } from './whisper'
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
+import { queueTranslation } from './translator'
 import {
   startCompareModeRecallRecording,
   startRecallAdHocRecording,
@@ -112,6 +113,7 @@ function fireTranscript(noteId: string, entries: TranscriptEntry[]): void {
   })
   for (const entry of entries) {
     log.local(`Transcript [${entry.speaker}]: ${entry.text}`)
+    queueTranslation(noteId, entry)
   }
 }
 
