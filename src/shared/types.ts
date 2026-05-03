@@ -13,6 +13,11 @@ export interface TranscriptEntry {
   text: string
   speaker: string
   timestamp: string
+  // English translation, populated asynchronously by the translator when the
+  // source text is detected as non-English (CJK chars). Absent until the
+  // Haiku call returns; absent forever if ANTHROPIC_API_KEY is unset or the
+  // text is already English.
+  translation?: string
 }
 
 export interface Meeting {
