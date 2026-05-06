@@ -6,7 +6,7 @@ import { createWindow, getMainWindow, sendToRenderer } from './window'
 import { initSDK } from './recall-sdk'
 import { killAllHelpers, startAdHocRecording, stopManualRecording } from './audio-capture'
 import { registerIpcHandlers } from './ipc'
-import { ensureMeetingsFile } from './storage'
+import { cleanOrphanedRecordings, ensureMeetingsFile } from './storage'
 import { sdkLogger } from './sdk-logger'
 import { log } from './log'
 import { startServer } from './server'
@@ -61,6 +61,11 @@ app.whenReady().then(async () => {
   )
 
   ensureMeetingsFile()
+  // Sweep out recordings that never got `recordingComplete: true` written —
+  // Ctrl-C in dev, force-quit, crashes, anything that bypassed the normal
+  // stop path. Must run BEFORE the renderer asks for meetings data so it
+  // doesn't render a phantom row.
+  cleanOrphanedRecordings()
   registerIpcHandlers()
 
   sdkLogger.onLog((entry) => {

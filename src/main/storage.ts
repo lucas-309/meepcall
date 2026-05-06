@@ -1,7 +1,8 @@
 import { app } from 'electron'
-import { promises as fsp, existsSync, writeFileSync } from 'node:fs'
+import { promises as fsp, existsSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { MeetingsData } from '@shared/types'
+import { log } from './log'
 
 const EMPTY_DATA: MeetingsData = { upcomingMeetings: [], pastMeetings: [] }
 
@@ -28,6 +29,37 @@ export function ensureMeetingsFile(): void {
   if (!existsSync(p)) {
     writeFileSync(p, JSON.stringify(EMPTY_DATA, null, 2))
   }
+}
+
+// Boot-time cleanup of orphaned recordings. When the app gets killed
+// (Ctrl-C in dev, force-quit, crash) without going through the normal
+// stop path, the in-progress meeting never gets `recordingComplete: true`
+// written and sits in pastMeetings forever as a phantom row. On the
+// next launch, sweep those out so the user starts clean. Sync I/O on
+// purpose: this runs once at boot before any IPC handlers, and we
+// don't want a race where the renderer reads the file mid-rewrite.
+export function cleanOrphanedRecordings(): void {
+  const p = meetingsFilePath()
+  if (!existsSync(p)) return
+  let data: MeetingsData
+  try {
+    data = JSON.parse(readFileSync(p, 'utf8')) as MeetingsData
+  } catch {
+    return
+  }
+  const before = data.pastMeetings?.length ?? 0
+  const cleaned = (data.pastMeetings ?? []).filter((m) => m.recordingComplete === true)
+  const removed = before - cleaned.length
+  if (removed === 0) return
+  data.pastMeetings = cleaned
+  writeFileSync(p, JSON.stringify(data, null, 2))
+  // Bust the in-memory cache too so the next read sees the cleaned data.
+  cached = null
+  lastReadTime = 0
+  log.warn(
+    'boot',
+    `Cleaned ${removed} orphaned recording${removed === 1 ? '' : 's'} (Ctrl-C / force-quit during a recording leaves recordingComplete=false). They've been removed from meetings.json.`
+  )
 }
 
 export async function readMeetingsData(): Promise<MeetingsData> {
