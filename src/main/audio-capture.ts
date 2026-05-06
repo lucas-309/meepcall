@@ -37,19 +37,17 @@ function compareModeEnabled(): boolean {
   return process.env.MEEPCALL_COMPARE_MODE === '1'
 }
 
-// Sliding-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
-// pipeline advances by STEP_SECONDS per chunk, so adjacent chunks overlap
-// by (CHUNK_SECONDS - STEP_SECONDS). The overlap gives whisper context
-// across cut boundaries; segments inside the overlap region are dropped
-// at transcript-emit time to avoid duplicate entries.
-const CHUNK_SECONDS = 3
-const STEP_SECONDS = 2
-const OVERLAP_SECONDS = CHUNK_SECONDS - STEP_SECONDS
-
-const STEP_BYTES = STEP_SECONDS * 16000 * 2 // 64,000 — fresh audio per chunk
-const OVERLAP_BYTES = OVERLAP_SECONDS * 16000 * 2 // 32,000 — tail kept around
-const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 96,000 — full chunk fed to whisper
-const STEP_MS = STEP_SECONDS * 1000
+// Fixed-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
+// pipeline advances by exactly CHUNK_SECONDS per chunk (no overlap, no
+// tail). Smaller chunks keep live latency low — end-to-end is roughly
+// CHUNK_SECONDS (audio wait) + whisper inference time. We dropped the
+// 1 s overlap that used to bridge cut boundaries because it doubled the
+// dedup machinery and only helped if a word fell exactly on a chunk
+// edge; for live debugging the occasional clipped boundary word is a
+// fine trade for halving end-to-end latency.
+const CHUNK_SECONDS = 2
+const CHUNK_BYTES = CHUNK_SECONDS * 16000 * 2 // 64,000 — bytes per chunk
+const CHUNK_MS = CHUNK_SECONDS * 1000
 
 // Phrase-VAD chunking (MEEPCALL_PHRASE_VAD=1). Cut on natural silence
 // boundaries detected by silero-vad (a small ONNX speech-detection model)
@@ -72,13 +70,62 @@ function usePhraseVad(): boolean {
 // is silent. The most common cause is missing Screen Recording permission.
 const SILENT_SOURCE_WARN_MS = 5000
 
+// Backpressure for the per-source whisper pipeline. Each chunk's
+// transcribeChunk call is awaited inside whisper.ts's per-source serial
+// queue, so a single slow chunk (CPU spike, swap, paged-out model weights)
+// stalls the chain. Without a cap, chunks pile up monotonically — by minute
+// 20 of a recording the backlog can be tens of seconds and live captions
+// drift far behind audio with no recovery path. Cap the number of in-flight
+// chunks per source: if we'd exceed it, drop the new chunk so audio loss
+// during slowdowns replaces live-caption lag. Default 3 = 6 s of backlog
+// at the 2 s chunk step before we start shedding.
+const MAX_INFLIGHT_CHUNKS = (() => {
+  const raw = Number(process.env.MEEPCALL_MAX_INFLIGHT_CHUNKS)
+  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw)
+  return 3
+})()
+
+// Pre-whisper silence gate. If a chunk's RMS amplitude is below this
+// threshold, skip the whisper-cli invocation entirely — the chunk is
+// silence, whisper would either return nothing or hallucinate ghost lines
+// like "Okay." / "Thanks for watching." / "[Music]". Skipping fixes BOTH
+// the hallucination spam AND the CPU pressure that triggers backpressure
+// for real speech later.
+//
+// Threshold rationale: 0.001 is "essentially silent" (1/1000 of full
+// scale Int16). The Swift heartbeat reports voice activity above ~0.005;
+// background hum sits between 0.0003 and 0.0008. 0.001 splits the
+// difference — drops chunks below background hum but keeps anything that
+// could plausibly be quiet voice. Set MEEPCALL_SILENCE_RMS_SKIP=0 to
+// disable (forwards every chunk to whisper unconditionally).
+const SILENCE_RMS_SKIP = (() => {
+  const raw = process.env.MEEPCALL_SILENCE_RMS_SKIP
+  if (raw === undefined || raw === '') return 0.001
+  const v = Number(raw)
+  return Number.isFinite(v) && v >= 0 ? v : 0.001
+})()
+
+// RMS amplitude of an interleaved Int16 LE PCM buffer, normalized to
+// [-1, 1]. Used by the pre-whisper silence gate. Single pass over ~32k
+// Int16 samples (2 s @ 16 kHz) takes ~1 ms — cheap relative to the ~2 s
+// whisper inference it lets us skip.
+function rmsOfPcm(pcm: Buffer): number {
+  const samples = pcm.length >> 1
+  if (samples === 0) return 0
+  let sumSq = 0
+  for (let i = 0; i + 1 < pcm.length; i += 2) {
+    const s = pcm.readInt16LE(i) / 32768
+    sumSq += s * s
+  }
+  return Math.sqrt(sumSq / samples)
+}
+
+
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
   pending: Buffer[]
   pendingBytes: number
   chunkIndex: number
-  // Sliding-window only: last OVERLAP_BYTES of previous chunk.
-  tail: Buffer
   // Phrase-VAD only: silero VAD instance; per-source serial queue so async
   // VAD inference calls don't interleave (silero's LSTM state must be fed
   // sequentially); ms of trailing silence detected; absolute audio start
@@ -88,7 +135,20 @@ interface SourceState {
   silenceMs: number
   chunkStartMs: number
   closed: Promise<void>
+  // Backpressure counters: chunks currently between flushChunk entry and
+  // exit (whisper-cli still working) and total chunks shed because the
+  // queue was full. The dropped count is logged once on stop so the user
+  // sees how much audio they lost to slowdowns. recentInferMs is a small
+  // rolling window of the most recent whisper-cli wall-clock times for
+  // this source — surfaced in the backpressure-drop warn so the user can
+  // see WHY whisper is behind (slow inference vs queue stuck for some
+  // other reason).
+  inFlight: number
+  droppedChunks: number
+  recentInferMs: number[]
 }
+
+const RECENT_INFER_LEN = 5
 
 interface RecorderHandle {
   recordingId: string
@@ -101,14 +161,172 @@ interface RecorderHandle {
 
 const handles = new Map<string, RecorderHandle>()
 
+// Cross-source bleed dedup. Mic picks up speaker bleed whenever the user
+// isn't on headphones — a song, a video, the other side of a call — so
+// the same utterance lands in BOTH sources at slightly different times.
+// Whisper transcribes each independently from different waveforms, so we
+// don't get IDENTICAL strings — we get FRAGMENTS of each other ("to how
+// do you" / "How do you make it?") emitted seconds apart, because mic
+// and system chunkers buffer audio independently.
+//
+// Two-direction defense:
+//   1. **Forward** — when mic emits, check the recent-system ring and
+//      drop the mic entry before it's persisted. Catches the
+//      system-first race.
+//   2. **Backward** — when system emits, scan recent mic entries already
+//      in the transcript and remove any that fuzzy-match. Catches the
+//      mic-first race (which is most of the user's data because mic
+//      chunks complete decoding faster than system chunks under load).
+//
+// Backward removal is destructive (mutates the persisted transcript) but
+// the alternative — holding mic emissions for 3 s before persisting —
+// adds caption latency that's worse for the live use case. The brief
+// flicker as bleed entries appear and disappear is acceptable.
+//
+// Fuzzy match: exact normalized equality, OR substring containment (one
+// is fragment of the other), OR ≥3 shared tokens with ≥60% overlap. The
+// 3-token + 60% combination is conservative enough to not catch real
+// conversation ("yes I agree" / "I agree completely" share only 2 tokens,
+// kept) while catching real bleed fragments.
+const CROSS_SOURCE_AUDIO_DELTA_MS = 4000
+const CROSS_SOURCE_RETENTION_MS = 8000
+const CROSS_SOURCE_MIN_LEN = 4
+const CROSS_SOURCE_FUZZY_MIN_CHARS = 8
+const CROSS_SOURCE_FUZZY_MIN_TOKENS = 3
+const CROSS_SOURCE_FUZZY_OVERLAP = 0.6
+
+interface RecentSysEntry {
+  norm: string
+  tokens: Set<string>
+  tsMs: number
+}
+const recentSystemByNote = new Map<string, RecentSysEntry[]>()
+
+function normalizeForDedup(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function tokenize(norm: string): Set<string> {
+  if (!norm) return new Set()
+  return new Set(norm.split(/\s+/).filter((t) => t.length > 0))
+}
+
+function fuzzyDedupMatch(
+  aNorm: string,
+  aTokens: Set<string>,
+  bNorm: string,
+  bTokens: Set<string>
+): boolean {
+  if (aNorm.length < CROSS_SOURCE_MIN_LEN || bNorm.length < CROSS_SOURCE_MIN_LEN) return false
+  if (aNorm === bNorm) return true
+  const minLen = Math.min(aNorm.length, bNorm.length)
+  if (minLen >= CROSS_SOURCE_FUZZY_MIN_CHARS) {
+    if (aNorm.includes(bNorm) || bNorm.includes(aNorm)) return true
+    let intersect = 0
+    for (const t of aTokens) if (bTokens.has(t)) intersect++
+    if (intersect >= CROSS_SOURCE_FUZZY_MIN_TOKENS) {
+      const overlap = intersect / Math.min(aTokens.size, bTokens.size)
+      if (overlap >= CROSS_SOURCE_FUZZY_OVERLAP) return true
+    }
+  }
+  return false
+}
+
+function pruneRecentSystem(noteId: string, nowMs: number): RecentSysEntry[] {
+  const arr = (recentSystemByNote.get(noteId) ?? []).filter(
+    (e) => nowMs - e.tsMs <= CROSS_SOURCE_RETENTION_MS
+  )
+  recentSystemByNote.set(noteId, arr)
+  return arr
+}
+
+function isMicBleed(noteId: string, entry: TranscriptEntry): boolean {
+  const norm = normalizeForDedup(entry.text)
+  if (norm.length < CROSS_SOURCE_MIN_LEN) return false
+  const tokens = tokenize(norm)
+  const entryMs = Date.parse(entry.timestamp)
+  const recent = pruneRecentSystem(noteId, Date.now())
+  return recent.some(
+    (r) =>
+      Math.abs(r.tsMs - entryMs) <= CROSS_SOURCE_AUDIO_DELTA_MS &&
+      fuzzyDedupMatch(norm, tokens, r.norm, r.tokens)
+  )
+}
+
+function recordSystemEmission(noteId: string, entry: TranscriptEntry): void {
+  const norm = normalizeForDedup(entry.text)
+  if (norm.length < CROSS_SOURCE_MIN_LEN) return
+  const arr = pruneRecentSystem(noteId, Date.now())
+  arr.push({ norm, tokens: tokenize(norm), tsMs: Date.parse(entry.timestamp) })
+}
+
 function fireTranscript(noteId: string, entries: TranscriptEntry[]): void {
   if (entries.length === 0) return
+  const source: WhisperSource = entries[0].speaker === 'You' ? 'mic' : 'system'
+
+  if (source === 'mic') {
+    const toPersist: TranscriptEntry[] = []
+    for (const entry of entries) {
+      if (isMicBleed(noteId, entry)) {
+        log.local(`drop[bleed forward]: ${entry.text}`)
+        continue
+      }
+      toPersist.push(entry)
+    }
+    if (toPersist.length === 0) return
+    void scheduleOperation((data) => {
+      const meeting = data.pastMeetings.find((m) => m.id === noteId)
+      if (!meeting) return null
+      if (!meeting.transcript) meeting.transcript = []
+      meeting.transcript.push(...toPersist)
+      sendToRenderer('transcript-updated', noteId)
+      return data
+    })
+    for (const entry of toPersist) {
+      log.local(`Transcript [${entry.speaker}]: ${entry.text}`)
+      queueTranslation(noteId, entry)
+    }
+    return
+  }
+
+  // System path: record for forward dedup, then both push the new system
+  // entries AND retroactively remove recent mic entries that fuzzy-match
+  // any of them (backward dedup for the mic-first race).
+  const sysMeta = entries.map((entry) => {
+    recordSystemEmission(noteId, entry)
+    const norm = normalizeForDedup(entry.text)
+    return { entry, norm, tokens: tokenize(norm), tsMs: Date.parse(entry.timestamp) }
+  })
+
   void scheduleOperation((data) => {
     const meeting = data.pastMeetings.find((m) => m.id === noteId)
     if (!meeting) return null
     if (!meeting.transcript) meeting.transcript = []
+    let removed = 0
+    meeting.transcript = meeting.transcript.filter((t) => {
+      if (t.speaker !== 'You') return true
+      const tNorm = normalizeForDedup(t.text)
+      if (tNorm.length < CROSS_SOURCE_MIN_LEN) return true
+      const tMs = Date.parse(t.timestamp)
+      const tTokens = tokenize(tNorm)
+      for (const sys of sysMeta) {
+        if (Math.abs(sys.tsMs - tMs) > CROSS_SOURCE_AUDIO_DELTA_MS) continue
+        if (fuzzyDedupMatch(tNorm, tTokens, sys.norm, sys.tokens)) {
+          removed++
+          return false
+        }
+      }
+      return true
+    })
     meeting.transcript.push(...entries)
     sendToRenderer('transcript-updated', noteId)
+    if (removed > 0) {
+      log.local(`drop[bleed backward]: removed ${removed} mic entries on system arrival`)
+    }
     return data
   })
   for (const entry of entries) {
@@ -125,7 +343,17 @@ function spawnHelper(source: WhisperSource): ChildProcessByStdio<null, Readable,
   let lastSamples = 0
   let firstSamplesLogged = false
   let silenceWarned = false
+  let silentRmsWarned = false
   let silenceTimer: NodeJS.Timeout | null = null
+  // RMS amplitude tracking. The Swift helper reports the per-second mean
+  // RMS; we keep a small ring of the last few seconds so the diagnostic
+  // doesn't trip on a single quiet beat.
+  const rmsHistory: number[] = []
+  const RMS_HISTORY_LEN = 8
+  // Voice is loud — even quiet conversational speech sits well above 0.005
+  // normalized RMS, while a "silent but live" mic (route wrong, muted,
+  // AirPods-output-only) reports near-zero (1e-5 to 1e-4).
+  const RMS_VOICE_FLOOR = 0.005
 
   proc.stderr.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim()
@@ -169,8 +397,62 @@ function spawnHelper(source: WhisperSource): ChildProcessByStdio<null, Readable,
             firstSamplesLogged = true
             log.local(`audio-helper(${source}): receiving audio (${lastSamples} samples so far)`)
           }
+          // RMS check: detects "samples flowing but silent" — the AirPods
+          // route bug where the mic node hands us frames of near-zero
+          // amplitude. Wait for RMS_HISTORY_LEN seconds of history before
+          // judging so we don't trip on natural pauses, then warn once.
+          if (typeof evt.rms === 'number') {
+            rmsHistory.push(evt.rms)
+            if (rmsHistory.length > RMS_HISTORY_LEN) rmsHistory.shift()
+            if (
+              !silentRmsWarned &&
+              firstSamplesLogged &&
+              rmsHistory.length === RMS_HISTORY_LEN &&
+              rmsHistory.every((v) => v < RMS_VOICE_FLOOR)
+            ) {
+              silentRmsWarned = true
+              if (source === 'mic') {
+                const rms = rmsHistory[rmsHistory.length - 1]
+                if (rms === 0) {
+                  log.warn(
+                    'audio',
+                    'mic samples are flowing but EXACTLY zero — the input device is producing silence (samples × any gain = silence). Most common cause: AirPods or other Bluetooth headset is the system default input but is in A2DP mode (no mic). The helper now binds to the built-in mic by default; if you still see this, check System Settings → Sound → Input and switch to "MacBook Microphone" (or your built-in mic), or unset MEEPCALL_USE_DEFAULT_INPUT.'
+                  )
+                } else {
+                  log.warn(
+                    'audio',
+                    `mic samples are flowing but RMS is ${rms.toFixed(5)} — well below the ${RMS_VOICE_FLOOR} voice floor. Possible causes: input level too low (System Settings → Sound → Input → raise the slider), wrong input device selected, or mic muted. Try MEEPCALL_MIC_GAIN=4 (software gain) or MEEPCALL_VOICE_PROCESSING=1 (AGC).`
+                  )
+                }
+              } else {
+                log.warn(
+                  'audio',
+                  `system audio RMS is ${rmsHistory[rmsHistory.length - 1].toFixed(5)} (voice floor ${RMS_VOICE_FLOOR}) — apps may be silent or muted, or system output is routed to a non-captured device.`
+                )
+              }
+            }
+          }
         } else if (evt.event === 'route_change' || evt.event === 'route_recovered') {
           log.local(`audio-helper(${source}): ${evt.event}`)
+        } else if (evt.event === 'voice_processing') {
+          if (evt.enabled) {
+            log.local(`audio-helper(${source}): voice_processing on (AGC + NS + AEC)`)
+          } else {
+            log.warn(
+              'audio',
+              `voice_processing failed: ${evt.error ?? 'unknown'} — proceeding with raw mic`
+            )
+          }
+        } else if (evt.event === 'mic_gain') {
+          log.local(`audio-helper(${source}): software gain ×${evt.gain}`)
+        } else if (evt.event === 'input_device') {
+          if (evt.type === 'built_in') {
+            log.local(`audio-helper(${source}): input bound to built-in mic (${evt.name})`)
+          } else {
+            log.local(
+              `audio-helper(${source}): input using system default (${evt.reason ?? 'unknown'})`
+            )
+          }
         }
       } catch {
         log.warn('audio', `${source} helper non-json: ${line}`)
@@ -209,27 +491,18 @@ function handleSlidingWindowData(
   ss.pending.push(chunk)
   ss.pendingBytes += chunk.length
 
-  // Emit as many chunks as we have data for. The first chunk needs a full
-  // CHUNK_BYTES of fresh audio (no tail yet); every chunk after that needs
-  // STEP_BYTES of fresh audio and prepends the saved tail.
-  while (true) {
-    const isFirst = ss.chunkIndex === 0
-    const needed = isFirst ? CHUNK_BYTES : STEP_BYTES
-    if (ss.pendingBytes < needed) break
-
+  // Fixed window: emit one chunk per CHUNK_BYTES of accumulated audio,
+  // then keep going until we drain. No overlap, no tail, no first-vs-rest
+  // distinction. The chunk's audio-time start is just `idx * CHUNK_MS`.
+  while (ss.pendingBytes >= CHUNK_BYTES) {
     const flat = Buffer.concat(ss.pending, ss.pendingBytes)
-    const fresh = flat.subarray(0, needed)
-    const chunkBuf = isFirst ? fresh : Buffer.concat([ss.tail, fresh])
-    // Save last OVERLAP_BYTES of this chunk for the next one. Buffer.from
-    // copies so we don't keep the full `flat` alive longer than needed.
-    ss.tail = Buffer.from(chunkBuf.subarray(chunkBuf.length - OVERLAP_BYTES))
-
-    const remainder = flat.subarray(needed)
+    const chunkBuf = Buffer.from(flat.subarray(0, CHUNK_BYTES))
+    const remainder = flat.subarray(CHUNK_BYTES)
     ss.pending = remainder.length > 0 ? [remainder] : []
     ss.pendingBytes = remainder.length
 
     const idx = ss.chunkIndex++
-    const chunkStartMs = idx * STEP_MS
+    const chunkStartMs = idx * CHUNK_MS
     void flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
   }
 }
@@ -284,25 +557,73 @@ async function flushChunk(
   handle: RecorderHandle,
   pcm: Buffer,
   chunkIndex: number,
-  chunkStartMs: number
+  chunkStartMs: number,
+  force = false
 ): Promise<void> {
-  const wavPath = join(tmpdir(), `meepcall-${handle.recordingId}-${source}-chunk-${chunkIndex}.wav`)
-  try {
-    await writeWavFile(wavPath, pcm)
-  } catch (err) {
-    log.err('audio', `failed to write chunk wav: ${(err as Error).message}`)
+  const ss = source === 'mic' ? handle.mic : handle.system
+  // Backpressure: if whisper is too far behind, drop this chunk instead of
+  // letting the queue grow unbounded. `force` is set by the final-drain
+  // path (after SIGTERM) where the chunk is the LAST one for this source
+  // and must not be dropped.
+  if (!force && ss && ss.inFlight >= MAX_INFLIGHT_CHUNKS) {
+    ss.droppedChunks++
+    const recent = ss.recentInferMs.length > 0
+      ? ` (recent inference: ${ss.recentInferMs.map((m) => `${(m / 1000).toFixed(1)}s`).join(' ')})`
+      : ''
+    log.warn(
+      'audio',
+      `${source}: queue depth ${ss.inFlight} ≥ ${MAX_INFLIGHT_CHUNKS}, dropping chunk #${chunkIndex}${recent}`
+    )
     return
   }
+
+  // Pre-whisper silence gate. Whisper-cli on a silent chunk wastes ~1.5–2 s
+  // of CPU AND tends to hallucinate ghost lines (Okay. / Thanks for
+  // watching. / [Music]). Skipping silent chunks here recovers both the
+  // CPU and the transcript hygiene.
+  if (SILENCE_RMS_SKIP > 0) {
+    const rms = rmsOfPcm(pcm)
+    if (rms < SILENCE_RMS_SKIP) {
+      if (process.env.MEEPCALL_DEBUG_WHISPER === '1') {
+        log.local(
+          `${source}: chunk #${chunkIndex} silent (rms=${rms.toFixed(5)} < ${SILENCE_RMS_SKIP}), skipping whisper`
+        )
+      }
+      return
+    }
+  }
+
+  if (ss) ss.inFlight++
+  const t0 = Date.now()
   try {
-    const entries = await handle.whisper.transcribeChunk(
-      wavPath,
-      chunkIndex,
-      source,
-      chunkStartMs
+    const wavPath = join(
+      tmpdir(),
+      `meepcall-${handle.recordingId}-${source}-chunk-${chunkIndex}.wav`
     )
-    fireTranscript(handle.noteId, entries)
-  } catch (err) {
-    log.err('audio', `whisper chunk failed: ${(err as Error).message}`)
+    try {
+      await writeWavFile(wavPath, pcm)
+    } catch (err) {
+      log.err('audio', `failed to write chunk wav: ${(err as Error).message}`)
+      return
+    }
+    try {
+      const entries = await handle.whisper.transcribeChunk(
+        wavPath,
+        chunkIndex,
+        source,
+        chunkStartMs
+      )
+      fireTranscript(handle.noteId, entries)
+    } catch (err) {
+      log.err('audio', `whisper chunk failed: ${(err as Error).message}`)
+    }
+  } finally {
+    if (ss) {
+      ss.inFlight--
+      const took = Date.now() - t0
+      ss.recentInferMs.push(took)
+      if (ss.recentInferMs.length > RECENT_INFER_LEN) ss.recentInferMs.shift()
+    }
   }
 }
 
@@ -325,18 +646,17 @@ async function drainAndFlushFinal(
   // Nothing fresh since the last chunk — bail.
   if (ss.pendingBytes === 0) return
 
-  const flat = Buffer.concat(ss.pending, ss.pendingBytes)
-  const isFirst = ss.chunkIndex === 0
-  // Phrase-VAD chunks don't overlap, so no tail to prepend.
-  const chunkBuf = vad ? flat : isFirst ? flat : Buffer.concat([ss.tail, flat])
+  const chunkBuf = Buffer.concat(ss.pending, ss.pendingBytes)
   ss.pending = []
   ss.pendingBytes = 0
 
   const idx = ss.chunkIndex++
-  const chunkStartMs = vad ? ss.chunkStartMs : idx * STEP_MS
+  const chunkStartMs = vad ? ss.chunkStartMs : idx * CHUNK_MS
   if (vad) ss.chunkStartMs += chunkBuf.length / 32
-  // Await this final chunk so the transcript is complete before the summary runs.
-  await flushChunk(source, handle, chunkBuf, idx, chunkStartMs)
+  // Await this final chunk so the transcript is complete before the summary
+  // runs. Force=true bypasses backpressure — we never want to drop the
+  // residual chunk just because earlier chunks are still in flight.
+  await flushChunk(source, handle, chunkBuf, idx, chunkStartMs, true)
 }
 
 function startSource(handle: RecorderHandle, source: WhisperSource): SourceState {
@@ -350,12 +670,14 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
     pending: [],
     pendingBytes: 0,
     chunkIndex: 0,
-    tail: Buffer.alloc(0),
     vad: null,
     vadQueue: Promise.resolve(),
     silenceMs: 0,
     chunkStartMs: 0,
-    closed
+    closed,
+    inFlight: 0,
+    droppedChunks: 0,
+    recentInferMs: []
   }
   // Lazily create the silero VAD only when phrase-VAD mode is on. The first
   // session creation pays a ~150 ms onnxruntime warm-up; subsequent sources
@@ -396,6 +718,12 @@ async function stopSource(
   )
   await Promise.race([ss.closed, timeout])
   await drainAndFlushFinal(source, handle, ss)
+  if (ss.droppedChunks > 0) {
+    log.warn(
+      'audio',
+      `${source}: ${ss.droppedChunks} chunks dropped due to whisper backpressure during this recording (raise MEEPCALL_MAX_INFLIGHT_CHUNKS, reduce MEEPCALL_WHISPER_THREADS contention, or use a smaller WHISPER_MODEL)`
+    )
+  }
 }
 
 async function createRecording(
@@ -529,6 +857,7 @@ export async function stopManualRecording(
 
     state.removeRecording(recordingId)
     delete state.activeMeetingIds[recordingId]
+    recentSystemByNote.delete(handle.noteId)
     return { success: true }
   } catch (err) {
     return { success: false, error: (err as Error).message }
