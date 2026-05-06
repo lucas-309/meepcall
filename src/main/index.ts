@@ -12,6 +12,9 @@ import { log } from './log'
 import { startServer } from './server'
 import { state } from './state'
 import { startAppWatcher } from './app-watcher'
+import { startWhisperServer, stopWhisperServer } from './whisper-server'
+
+const WHISPER_MODEL = process.env.WHISPER_MODEL?.trim() || 'ggml-large-v3-turbo.bin'
 
 const RECORD_HOTKEY = 'CommandOrControl+Shift+R'
 
@@ -77,6 +80,21 @@ app.whenReady().then(async () => {
   createWindow()
   startAppWatcher()
 
+  // Warm-start the whisper.cpp HTTP server so the model is resident in
+  // memory by the time the user hits ⌘⇧R. Without this, the first chunk
+  // of every recording would pay the ~3-5 s cold model-load tax. We don't
+  // await it — boot finishes immediately, the server keeps loading in the
+  // background, and the first transcribeChunk() call awaits the same
+  // promise. Set MEEPCALL_WHISPER_LAZY=1 to defer until first recording.
+  if (process.env.MEEPCALL_WHISPER_LAZY !== '1') {
+    void startWhisperServer(WHISPER_MODEL).catch((err) => {
+      log.warn(
+        'local',
+        `whisper-server eager start failed: ${err.message}. Will retry on first recording.`
+      )
+    })
+  }
+
   if (globalShortcut.register(RECORD_HOTKEY, () => void toggleRecordingFromHotkey())) {
     log.ok('hotkey', `Registered ${RECORD_HOTKEY} — toggles recording from anywhere`)
   } else {
@@ -104,4 +122,5 @@ app.on('window-all-closed', () => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
   killAllHelpers()
+  stopWhisperServer()
 })
