@@ -12,6 +12,12 @@ files:
 asarUnpack:
   - resources/**
   - node_modules/@recallai/**
+  # NLLB inference runs in a forked Node child process and needs to require
+  # @huggingface/transformers + onnxruntime-node from disk paths, not via the
+  # asar archive (the worker is a plain .mjs file outside the bundler).
+  - node_modules/@huggingface/**
+  - node_modules/onnxruntime-node/**
+  - node_modules/onnxruntime-common/**
 extraResources:
   - from: build/bin/audio-helper
     to: bin/audio-helper
@@ -23,6 +29,8 @@ extraResources:
     to: models/ggml-large-v3-turbo.bin
   - from: build/models/silero-vad.onnx
     to: models/silero-vad.onnx
+  - from: scripts/nllb-worker.mjs
+    to: scripts/nllb-worker.mjs
 mac:
   target:
     - dmg

@@ -14,10 +14,14 @@ export interface TranscriptEntry {
   speaker: string
   timestamp: string
   // English translation, populated asynchronously by the translator when the
-  // source text is detected as non-English (CJK chars). Absent until the
-  // Haiku call returns; absent forever if ANTHROPIC_API_KEY is unset or the
-  // text is already English.
+  // source text is detected as non-English. Absent until the engine returns;
+  // absent forever if no engine can translate (no API key for Haiku and
+  // local engine disabled, or the text is already English).
   translation?: string
+  // Whisper-detected source language (ISO 639-1: en, zh, ja, ...). Used by
+  // the local NLLB engine to pick the right source-language token; ignored
+  // by Haiku which detects from the text itself.
+  sourceLanguage?: string
 }
 
 export interface Meeting {
