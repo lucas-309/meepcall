@@ -20,6 +20,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="$ROOT/build/bin"
 MODEL_DIR="$ROOT/build/models"
 WHISPER_BIN="$BIN_DIR/whisper-cli"
+WHISPER_SERVER_BIN="$BIN_DIR/whisper-server"
 MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
 
 mkdir -p "$BIN_DIR" "$MODEL_DIR"
@@ -28,7 +29,7 @@ SILERO_VAD_PATH="$MODEL_DIR/silero-vad.onnx"
 SILERO_VAD_URL="https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
 
 if [ "${FORCE:-0}" = "1" ]; then
-  rm -f "$WHISPER_BIN" "$MODEL_PATH" "$SILERO_VAD_PATH"
+  rm -f "$WHISPER_BIN" "$WHISPER_SERVER_BIN" "$MODEL_PATH" "$SILERO_VAD_PATH"
 fi
 
 # ─── Model ────────────────────────────────────────────────────────────────────
@@ -41,8 +42,13 @@ else
   echo "✓ model already present: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
 fi
 
-# ─── whisper-cli ──────────────────────────────────────────────────────────────
-if [ ! -x "$WHISPER_BIN" ]; then
+# ─── whisper-cli + whisper-server ─────────────────────────────────────────────
+# Both come from the same whisper.cpp source tree; we build them in one cmake
+# pass and copy each binary into build/bin/. whisper-server is the live-path
+# winner — it loads the model once into resident memory and serves chunks
+# over HTTP, eliminating the per-chunk model-load cost that whisper-cli pays.
+# whisper-cli stays around as a fallback / one-shot tool.
+if [ ! -x "$WHISPER_BIN" ] || [ ! -x "$WHISPER_SERVER_BIN" ]; then
   echo "→ building whisper.cpp $WHISPER_TAG from source …"
   if ! command -v cmake >/dev/null 2>&1; then
     echo "ERROR: cmake is required (brew install cmake)" >&2
@@ -55,13 +61,14 @@ if [ ! -x "$WHISPER_BIN" ]; then
   git clone --depth 1 --branch "$WHISPER_TAG" https://github.com/ggml-org/whisper.cpp.git
   cd whisper.cpp
   # BUILD_SHARED_LIBS=OFF → statically link libwhisper / libggml so we can ship
-  # a single self-contained whisper-cli binary (no dylibs to chase).
+  # self-contained binaries (no dylibs to chase). WHISPER_BUILD_SERVER=ON adds
+  # the HTTP server binary.
   cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON \
     -DBUILD_SHARED_LIBS=OFF \
     -DWHISPER_BUILD_TESTS=OFF \
-    -DWHISPER_BUILD_SERVER=OFF
+    -DWHISPER_BUILD_SERVER=ON
   cmake --build build -j --config Release
 
   # whisper.cpp v1.7+ produces build/bin/whisper-cli; older versions called it main.
@@ -74,10 +81,25 @@ if [ ! -x "$WHISPER_BIN" ]; then
     exit 1
   fi
   chmod +x "$WHISPER_BIN"
+
+  # whisper-server lives at build/bin/whisper-server (or build/bin/server in
+  # older trees, though v1.7+ uses the prefixed name).
+  if [ -x build/bin/whisper-server ]; then
+    cp build/bin/whisper-server "$WHISPER_SERVER_BIN"
+  elif [ -x build/bin/server ]; then
+    cp build/bin/server "$WHISPER_SERVER_BIN"
+  else
+    echo "ERROR: could not find built whisper-server (looked at build/bin/whisper-server, build/bin/server)" >&2
+    exit 1
+  fi
+  chmod +x "$WHISPER_SERVER_BIN"
+
   cd "$ROOT"
   echo "✓ built: $WHISPER_BIN"
+  echo "✓ built: $WHISPER_SERVER_BIN"
 else
   echo "✓ whisper-cli already present: $WHISPER_BIN"
+  echo "✓ whisper-server already present: $WHISPER_SERVER_BIN"
 fi
 
 # ─── silero-vad ───────────────────────────────────────────────────────────────
@@ -92,6 +114,7 @@ fi
 
 echo
 echo "ready:"
-echo "  bin:        $WHISPER_BIN"
-echo "  model:      $MODEL_PATH"
-echo "  silero-vad: $SILERO_VAD_PATH"
+echo "  whisper-cli:    $WHISPER_BIN"
+echo "  whisper-server: $WHISPER_SERVER_BIN"
+echo "  model:          $MODEL_PATH"
+echo "  silero-vad:     $SILERO_VAD_PATH"

@@ -16,6 +16,7 @@
     "prod": "./dist/mac-arm64/meepcall.app/Contents/MacOS/meepcall",
     "build:audio-helper": "bash src/main/audio-helper/build.sh",
     "fetch:whisper-assets": "bash scripts/fetch-whisper-assets.sh",
+    "fetch:nllb-model": "node scripts/fetch-nllb-model.mjs",
     "prebuild:assets": "npm run fetch:whisper-assets && npm run build:audio-helper",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
@@ -29,11 +30,13 @@
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
     "@electron/fuses": "^2.1.1",
+    "@huggingface/transformers": "^4.2.0",
     "@recallai/desktop-sdk": "^2.0.11",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "onnxruntime-node": "^1.24.3",
-    "react-markdown": "^10.1.0"
+    "react-markdown": "^10.1.0",
+    "undici": "^8.3.0"
   },
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "^3.0.0",

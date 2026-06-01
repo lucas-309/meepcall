@@ -1,12 +1,23 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { TranscriptEntry } from '@shared/types'
 import { log } from './log'
+import { translateLocal } from './nllb-translate'
 import { scheduleOperation } from './storage'
 import { sendToRenderer } from './window'
 
 // Haiku 4.5 — fast + cheap, plenty for line-by-line translation. Override via
 // MEEPCALL_TRANSLATE_MODEL if you want to A/B against Sonnet/Opus.
 const MODEL = process.env.MEEPCALL_TRANSLATE_MODEL?.trim() || 'claude-haiku-4-5-20251001'
+
+// Translation engine selector. Default `haiku` keeps the ASR-error-correction
+// + context-aware homophone-recovery logic that's been tuned in this file.
+// Set MEEPCALL_TRANSLATE_ENGINE=local to use NLLB-200-distilled-600M
+// on-device — sub-200ms per line, no API key, but no ASR correction.
+type TranslateEngine = 'haiku' | 'local'
+function getEngine(): TranslateEngine {
+  const raw = (process.env.MEEPCALL_TRANSLATE_ENGINE ?? 'haiku').trim().toLowerCase()
+  return raw === 'local' ? 'local' : 'haiku'
+}
 
 // Trigger translation when the line contains any character from a
 // non-English script. Built via new RegExp so the source file stays ASCII.
@@ -38,44 +49,27 @@ const NON_ENGLISH_RE = new RegExp(
     '|[\\u00c0-\\u00ff\\u0100-\\u017f]' // Latin-1 Supplement + Latin Extended-A (diacritics)
 )
 
+// Output is forced via assistant prefill `<en>` + stop_sequences `</en>` in
+// translateAndPersist. The system prompt only needs to describe the task and
+// the silent ASR-correction capability — every "output ONLY" instruction
+// from the previous version was bypassed by the model dumping its analysis
+// before the translation. The prefill leaves no room for preamble.
 const SYSTEM_PROMPT =
-  'You translate short live-captioning lines from ANY non-English language ' +
-  'into natural, fluent English. The source language varies (Mandarin, ' +
-  'Cantonese, Japanese, Korean, Spanish, French, German, Russian, Arabic, ' +
-  'Hindi, Portuguese, Italian, Vietnamese, Thai — anything). Detect the ' +
-  'language from the text itself; do not ask.\n\n' +
-  'CRITICAL: the source text comes from automatic speech recognition ' +
-  '(whisper) and may contain SOUND-ALIKE errors. Whisper often substitutes ' +
-  'characters or words that share pronunciation with the intended word — ' +
-  'Mandarin homophones with the same pinyin, Cantonese near-homophones, ' +
-  'Korean hangul with the same syllable sound, Japanese kana mishearings, ' +
-  'Spanish/French wrong-accent or wrong-conjugation forms, Russian wrong-case ' +
-  'endings, etc. When a phrase looks ungrammatical, nonsensical, or out of ' +
-  'place:\n' +
-  '  1. Read the input PHONETICALLY (pinyin / hangul / kana / IPA-like ' +
-  'sounds for whatever script), not by literal character/word meaning.\n' +
-  '  2. Use the surrounding CONTEXT (and common phrases / song lyrics / ' +
-  'idioms) to infer the most plausible INTENDED phrase that sounds the same ' +
-  'or nearly the same.\n' +
-  '  3. Translate the INFERRED meaning, not the literal text.\n' +
-  'Examples of what to fix silently:\n' +
-  '  • Mandarin "不要把河河" (don\'t put the river river — nonsense) → likely ' +
-  'a homophone of 河 like 喝/合; infer from context.\n' +
-  '  • Mandarin "伴侯的五美书香" (literal: "companion-marquis\'s five-beauty ' +
-  'book-fragrance" — nonsense) → likely a stock phrase the speaker actually ' +
-  'said; infer phonetically.\n' +
-  '  • Spanish "esta" vs "está" — whisper drops accent marks; infer the ' +
-  'correct form from context.\n' +
-  '  • duplicated characters/words ("河河", "the the") often = transcription ' +
-  'stutter, collapse to one.\n\n' +
-  'Output ONLY the English translation of the line marked "TRANSLATE:" — no ' +
-  'quotes, no romanization, no commentary, no language label, no speaker ' +
-  'prefix, no "[corrected]" notes. Earlier lines may appear above as ' +
-  'CONTEXT — use them only to resolve pronouns, idioms, topic continuity, ' +
-  'and sound-alike errors; do NOT translate or repeat them. Preserve speaker ' +
-  'tone (casual, formal, lyrical). Never output gibberish or transliteration ' +
-  '— always output a fluent English sentence. If the input is already in ' +
-  'English, repeat it verbatim.'
+  'Real-time English translator for live captions. The user message contains ' +
+  'a single short line in some non-English language (Mandarin, Cantonese, ' +
+  'Japanese, Korean, Spanish, French, German, Russian, Arabic, Hindi, ' +
+  'Portuguese, Italian, Vietnamese, Thai, etc., or any other). Translate ' +
+  'into natural, fluent English.\n\n' +
+  'The text comes from automatic speech recognition (whisper) and often ' +
+  'contains sound-alike errors: Mandarin/Cantonese homophones, dropped ' +
+  'accent marks, wrong case or conjugation, duplicated stutter words. When ' +
+  'the literal reading is ungrammatical or nonsensical, silently re-read it ' +
+  'phonetically and use the surrounding context to recover the intended ' +
+  'phrase. Do all reasoning internally — never write it down, never explain.\n\n' +
+  'CONTEXT lines, when present, are prior captions for disambiguation only. ' +
+  'Never translate or repeat them.\n\n' +
+  'If the input is already English, output it verbatim. Always output a ' +
+  'fluent English sentence — never gibberish, transliteration, or pinyin.'
 
 let _client: Anthropic | null | undefined
 function getClient(): Anthropic | null {
@@ -93,10 +87,18 @@ export function needsTranslation(text: string): boolean {
   return NON_ENGLISH_RE.test(text)
 }
 
-// In-flight + completed dedup. Keyed by `${noteId}|${timestamp}|${text}`. The
-// recall-sdk path can call us with the same entry shape multiple times per
-// realtime-event burst; this guard keeps us at one API call per entry.
-const seen = new Set<string>()
+// Two-tier dedup keyed by `${noteId}|${timestamp}|${text}`:
+//   - `inflight`: a translation is currently being attempted. Prevents a
+//     duplicate concurrent call (e.g., Recall fires the same entry twice
+//     in one burst). Cleared when the attempt resolves.
+//   - `succeeded`: a translation was successfully persisted. Final dedup
+//     so we don't re-translate the same line. Never cleared.
+// Splitting the two means a TRANSIENT failure (NLLB worker crash, Haiku
+// rate limit, network blip) doesn't permanently mark the entry as done —
+// the next emission of the same entry will retry. Adversarial review
+// flagged the prior single-set design as silently swallowing failures.
+const inflight = new Set<string>()
+const succeeded = new Set<string>()
 
 // Per-note rolling context window. Each translation call gets a snapshot of
 // the prior CONTEXT_LINES source-language lines so Haiku can resolve
@@ -126,58 +128,66 @@ function snapshotAndPushContext(noteId: string, entry: TranscriptEntry): Context
   return snapshot
 }
 
-// Translations fire in parallel — every line gets its own API call the moment
-// it arrives. A serial queue used to live here for log readability, but it
-// turned dense bursts (a song, a fast speaker) into 12–16s tails: 8 queued
-// lines × ~1.5s/Haiku call = the live caption falls way behind the
-// transcript. Order doesn't matter for correctness because the persist
-// layer matches by timestamp+text+speaker, not by arrival order.
+// Translations fire in parallel — every line gets its own engine call the
+// moment it arrives. A serial queue used to live here for log readability,
+// but it turned dense bursts (a song, a fast speaker) into 12–16s tails on
+// the Haiku path: 8 queued lines × ~1.5s/call = the live caption falls way
+// behind the transcript. Order doesn't matter for correctness because the
+// persist layer matches by timestamp+text+speaker, not by arrival order.
 export function queueTranslation(noteId: string, entry: TranscriptEntry): void {
   if (entry.translation) return
   if (!needsTranslation(entry.text)) return
-  const client = getClient()
-  if (!client) return
 
   const key = `${noteId}|${entry.timestamp}|${entry.text}`
-  if (seen.has(key)) return
-  seen.add(key)
+  if (succeeded.has(key) || inflight.has(key)) return
 
-  const context = snapshotAndPushContext(noteId, entry)
-  void translateAndPersist(client, noteId, entry, context).catch(() => undefined)
+  const engine = getEngine()
+  let attempt: Promise<boolean>
+  if (engine === 'local') {
+    // NLLB doesn't benefit from chat-style context; skip the ring-buffer
+    // snapshot. Faster end-to-end and avoids confusing the seq2seq model
+    // with multi-line input it'd want to translate as one block.
+    inflight.add(key)
+    attempt = translateLocalAndPersist(noteId, entry)
+  } else {
+    const client = getClient()
+    if (!client) return
+    inflight.add(key)
+    const context = snapshotAndPushContext(noteId, entry)
+    attempt = translateAndPersist(client, noteId, entry, context)
+  }
+
+  void attempt
+    .then((ok) => {
+      if (ok) succeeded.add(key)
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      inflight.delete(key)
+    })
 }
 
-function buildUserContent(entry: TranscriptEntry, context: ContextEntry[]): string {
-  if (context.length === 0) return `TRANSLATE:\n${entry.text}`
-  const ctx = context.map((c) => `${c.speaker}: ${c.text}`).join('\n')
-  return `CONTEXT (do not translate):\n${ctx}\n\nTRANSLATE:\n${entry.text}`
+// Returns true on a real persisted translation, false on engine failure
+// or no-op (translation matched input, init failed, etc.). Only `true`
+// marks the entry as `succeeded`; `false` leaves it eligible for retry on
+// the next emission of the same line.
+async function translateLocalAndPersist(
+  noteId: string,
+  entry: TranscriptEntry
+): Promise<boolean> {
+  const t0 = Date.now()
+  const translation = await translateLocal(entry.text, entry.sourceLanguage)
+  if (!translation || translation === entry.text) return false
+  log.ai(`Translation [${entry.speaker}] (local ${Date.now() - t0}ms): ${translation}`)
+  await persistTranslation(noteId, entry, translation)
+  return true
 }
 
-async function translateAndPersist(
-  client: Anthropic,
+async function persistTranslation(
   noteId: string,
   entry: TranscriptEntry,
-  context: ContextEntry[]
+  translation: string
 ): Promise<void> {
-  let translation = ''
-  try {
-    const resp = await client.messages.create({
-      model: MODEL,
-      max_tokens: 256,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: buildUserContent(entry, context) }]
-    })
-    for (const block of resp.content) {
-      if (block.type === 'text') translation += block.text
-    }
-    translation = translation.trim()
-  } catch (err) {
-    log.warn('ai', `translation failed: ${(err as Error).message}`)
-    return
-  }
-  if (!translation || translation === entry.text) return
-
-  log.ai(`Translation [${entry.speaker}]: ${translation}`)
-
   await scheduleOperation((data) => {
     const meeting = data.pastMeetings.find((m) => m.id === noteId)
     if (!meeting?.transcript) return null
@@ -193,4 +203,50 @@ async function translateAndPersist(
     sendToRenderer('transcript-updated', noteId)
     return data
   })
+}
+
+function buildUserContent(entry: TranscriptEntry, context: ContextEntry[]): string {
+  if (context.length === 0) return `<input>${entry.text}</input>`
+  const ctx = context.map((c) => `${c.speaker}: ${c.text}`).join('\n')
+  return `<context>\n${ctx}\n</context>\n\n<input>${entry.text}</input>`
+}
+
+async function translateAndPersist(
+  client: Anthropic,
+  noteId: string,
+  entry: TranscriptEntry,
+  context: ContextEntry[]
+): Promise<boolean> {
+  let translation = ''
+  try {
+    // Assistant prefill `<en>` anchors the response to start at the
+    // translation. stop_sequences `</en>` halts the model the instant it
+    // closes the tag — no trailing analysis can leak through. Together they
+    // make every byte of resp.content the translation itself.
+    const resp = await client.messages.create({
+      model: MODEL,
+      max_tokens: 256,
+      system: SYSTEM_PROMPT,
+      stop_sequences: ['</en>'],
+      messages: [
+        { role: 'user', content: buildUserContent(entry, context) },
+        { role: 'assistant', content: '<en>' }
+      ]
+    })
+    for (const block of resp.content) {
+      if (block.type === 'text') translation += block.text
+    }
+    // Defensive: if the model leaked a literal </en> anyway, cut at it.
+    const closeIdx = translation.indexOf('</en>')
+    if (closeIdx >= 0) translation = translation.slice(0, closeIdx)
+    translation = translation.trim()
+  } catch (err) {
+    log.warn('ai', `translation failed: ${(err as Error).message}`)
+    return false
+  }
+  if (!translation || translation === entry.text) return false
+
+  log.ai(`Translation [${entry.speaker}]: ${translation}`)
+  await persistTranslation(noteId, entry, translation)
+  return true
 }

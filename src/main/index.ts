@@ -1,17 +1,32 @@
 import { app, BrowserWindow, globalShortcut, Notification } from 'electron'
 import { electronApp, optimizer } from '@electron-toolkit/utils'
 import 'dotenv/config'
+import { setGlobalDispatcher, EnvHttpProxyAgent } from 'undici'
+
+// Route Node's global fetch through an HTTP(S) proxy when one is configured.
+// The Anthropic SDK (translation + AI summary) runs on Node's native fetch =
+// undici, which — unlike curl — ignores the http_proxy/https_proxy env vars.
+// On networks where api.anthropic.com is reachable only via a local proxy,
+// that means every SDK call connects directly and gets a region 403
+// (`{"error":{"type":"forbidden","message":"Request not allowed"}}`).
+// EnvHttpProxyAgent reads http_proxy/https_proxy/no_proxy (case-insensitive)
+// and dispatches accordingly; no_proxy keeps the localhost whisper-server
+// calls direct. When no proxy var is set the agent is a passthrough — no-op.
+setGlobalDispatcher(new EnvHttpProxyAgent({ noProxy: 'localhost,127.0.0.1,::1' }))
 
 import { createWindow, getMainWindow, sendToRenderer } from './window'
 import { initSDK } from './recall-sdk'
 import { killAllHelpers, startAdHocRecording, stopManualRecording } from './audio-capture'
 import { registerIpcHandlers } from './ipc'
-import { ensureMeetingsFile } from './storage'
+import { cleanOrphanedRecordings, ensureMeetingsFile } from './storage'
 import { sdkLogger } from './sdk-logger'
 import { log } from './log'
 import { startServer } from './server'
 import { state } from './state'
 import { startAppWatcher } from './app-watcher'
+import { startWhisperServer, stopWhisperServer } from './whisper-server'
+
+const WHISPER_MODEL = process.env.WHISPER_MODEL?.trim() || 'ggml-large-v3-turbo.bin'
 
 const RECORD_HOTKEY = 'CommandOrControl+Shift+R'
 
@@ -61,6 +76,11 @@ app.whenReady().then(async () => {
   )
 
   ensureMeetingsFile()
+  // Sweep out recordings that never got `recordingComplete: true` written —
+  // Ctrl-C in dev, force-quit, crashes, anything that bypassed the normal
+  // stop path. Must run BEFORE the renderer asks for meetings data so it
+  // doesn't render a phantom row.
+  cleanOrphanedRecordings()
   registerIpcHandlers()
 
   sdkLogger.onLog((entry) => {
@@ -71,6 +91,21 @@ app.whenReady().then(async () => {
   await initSDK()
   createWindow()
   startAppWatcher()
+
+  // Warm-start the whisper.cpp HTTP server so the model is resident in
+  // memory by the time the user hits ⌘⇧R. Without this, the first chunk
+  // of every recording would pay the ~3-5 s cold model-load tax. We don't
+  // await it — boot finishes immediately, the server keeps loading in the
+  // background, and the first transcribeChunk() call awaits the same
+  // promise. Set MEEPCALL_WHISPER_LAZY=1 to defer until first recording.
+  if (process.env.MEEPCALL_WHISPER_LAZY !== '1') {
+    void startWhisperServer(WHISPER_MODEL).catch((err) => {
+      log.warn(
+        'local',
+        `whisper-server eager start failed: ${err.message}. Will retry on first recording.`
+      )
+    })
+  }
 
   if (globalShortcut.register(RECORD_HOTKEY, () => void toggleRecordingFromHotkey())) {
     log.ok('hotkey', `Registered ${RECORD_HOTKEY} — toggles recording from anywhere`)
@@ -99,4 +134,5 @@ app.on('window-all-closed', () => {
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
   killAllHelpers()
+  stopWhisperServer()
 })
