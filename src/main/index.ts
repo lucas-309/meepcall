@@ -1,6 +1,18 @@
 import { app, BrowserWindow, globalShortcut, Notification } from 'electron'
 import { electronApp, optimizer } from '@electron-toolkit/utils'
 import 'dotenv/config'
+import { setGlobalDispatcher, EnvHttpProxyAgent } from 'undici'
+
+// Route Node's global fetch through an HTTP(S) proxy when one is configured.
+// The Anthropic SDK (translation + AI summary) runs on Node's native fetch =
+// undici, which — unlike curl — ignores the http_proxy/https_proxy env vars.
+// On networks where api.anthropic.com is reachable only via a local proxy,
+// that means every SDK call connects directly and gets a region 403
+// (`{"error":{"type":"forbidden","message":"Request not allowed"}}`).
+// EnvHttpProxyAgent reads http_proxy/https_proxy/no_proxy (case-insensitive)
+// and dispatches accordingly; no_proxy keeps the localhost whisper-server
+// calls direct. When no proxy var is set the agent is a passthrough — no-op.
+setGlobalDispatcher(new EnvHttpProxyAgent({ noProxy: 'localhost,127.0.0.1,::1' }))
 
 import { createWindow, getMainWindow, sendToRenderer } from './window'
 import { initSDK } from './recall-sdk'
