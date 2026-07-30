@@ -81,32 +81,24 @@ Pick the URL for your Recall workspace in `.env`: `us-west-2.recall.ai` (PAYG), 
 
 **Distributable DMG:** `pnpm build:mac`. Configure your Apple Developer ID in `electron-builder.yml` for signing/notarization. Without one, electron-builder ad-hoc signs the .app and ships with `hardenedRuntime: false` (needed for the dyld loader to accept ad-hoc signed frameworks; fine for personal use, not for distribution outside your machine). `extraResources` binaries (`audio-helper`, `whisper-cli`, ONNX model) get auto-codesigned alongside the bundle.
 
-**Sanity-check the upload-token server** (used only by the Recall meeting path):
-
-```bash
-curl http://localhost:13373/start-recording
-# {"status":"success","upload_token":"..."}
-```
-
-**Sanity-check the Swift sidecar in isolation:**
-
-```bash
-./build/bin/audio-helper --source mic > /tmp/mic.raw 2> /tmp/mic.err &
-sleep 3 && kill %1
-ffplay -f s16le -ar 16000 -ac 1 /tmp/mic.raw   # play it back
-```
+**Sanity-check snippets** (upload-token server, audio-helper isolation, etc.) live in `docs/AGENT_REFERENCE.md`.
 
 ### Tunable env vars
 
-- `WHISPER_MODEL` — `ggml-large-v3-turbo.bin` (default), `ggml-medium.bin`, `ggml-small.bin`, `ggml-base.en.bin`, or `ggml-large-v3.bin` (true SOTA but ~3 GB; per-chunk inference often exceeds the 2 s pipeline step on M1/M2, so transcripts fall behind speech). Must match what `pnpm fetch:whisper-assets` downloaded (set `WHISPER_MODEL_NAME=…` there).
-- `WHISPER_LANGUAGE` — `auto` (default, multilingual) or any ISO code (`en`, `es`, `ja`, …) to skip per-chunk detection.
-- `MEEPCALL_NO_SPEECH_THOLD` — `0.6` default; lower (`0.3`–`0.4`) for music, higher (`0.7`–`0.8`) to suppress hallucinations on quiet audio.
-- `MEEPCALL_PHRASE_VAD=1` — opt-in phrase-boundary chunking via silero-vad instead of the fixed sliding window. Cuts at natural speech pauses (1–5 s chunks). Best for pure conversational audio; on continuous music silero correctly identifies non-speech and the chunker falls through to a 5 s max-cap, so music transcription degrades — leave off for mixed voice/music workflows.
-- `MEEPCALL_DEBUG_WHISPER=1` — log every segment whisper produces and what filtered it.
-- `MEEPCALL_WHISPER_NO_FILTERS=1` — bypass hallucination + dedup filters.
-- `MEEPCALL_USE_RECALL_FOR_ADHOC=1` — route ad-hoc recordings through Recall's `prepareDesktopAudioRecording` instead of the local engine. Costs Recall credits; useful for A/B-ing transcript quality.
-- `MEEPCALL_COMPARE_MODE=1` — run both engines in parallel on ad-hoc recordings. Local writes to the note as normal; Recall transcripts print to the terminal with `[recall]` tags. Costs Recall credits for the duration.
-- `MEEPCALL_RECALL_LANG` / `MEEPCALL_RECALL_MODE` — per-run override for the `recallai_streaming` provider config. Defaults `en` / `prioritize_low_latency` (the only combo the Desktop SDK supports for Recall's own provider). For multilingual real-time you'd swap the provider to Deepgram or AssemblyAI in `src/main/server.ts`, not just flip these.
+| Var | What it does |
+| --- | --- |
+| `WHISPER_MODEL` | `ggml-large-v3-turbo.bin` (default) / `medium` / `small` / `base.en` / `large-v3`. Must match `pnpm fetch:whisper-assets` (set `WHISPER_MODEL_NAME=…` there). |
+| `WHISPER_LANGUAGE` | `auto` (default, multilingual) or ISO code to skip per-chunk detection. |
+| `DISABLE_MIC=1` | Skip mic capture and transcribe system audio only. Use `DISABLE_MIC=1 pnpm dev` for speaker playback without duplicate `You` lines. |
+| `MEEPCALL_NO_SPEECH_THOLD` | `0.6` default. Lower for music, higher to suppress quiet-audio hallucinations. |
+| `MEEPCALL_PHRASE_VAD=1` | Opt-in silero phrase-boundary chunker. Best for pure speech; degrades on music. |
+| `MEEPCALL_DEBUG_WHISPER=1` | Log every whisper segment + which filter dropped it. |
+| `MEEPCALL_WHISPER_NO_FILTERS=1` | Bypass hallucination + dedup filters. |
+| `MEEPCALL_USE_RECALL_FOR_ADHOC=1` | Route ⌘⇧R through Recall instead of the local engine. Costs Recall credits. |
+| `MEEPCALL_COMPARE_MODE=1` | Local + shadow Recall in parallel; Recall lines print to terminal. Costs Recall credits. |
+| `MEEPCALL_RECALL_LANG` / `MEEPCALL_RECALL_MODE` | Per-run override for `recallai_streaming`. Defaults `en` / `prioritize_low_latency`. For multilingual real-time swap the provider in `src/main/server.ts`. |
+
+Full rationale + the `MEEPCALL_TRANSLATE_ENGINE` / `NLLB_DTYPE` / `USE_DEFAULT_INPUT` / `MIC_GAIN` family is in `docs/AGENT_REFERENCE.md`.
 
 ## Usage
 

@@ -9,14 +9,27 @@ import { sendToRenderer } from './window'
 // MEEPCALL_TRANSLATE_MODEL if you want to A/B against Sonnet/Opus.
 const MODEL = process.env.MEEPCALL_TRANSLATE_MODEL?.trim() || 'claude-haiku-4-5-20251001'
 
-// Translation engine selector. Default `haiku` keeps the ASR-error-correction
-// + context-aware homophone-recovery logic that's been tuned in this file.
-// Set MEEPCALL_TRANSLATE_ENGINE=local to use NLLB-200-distilled-600M
-// on-device — sub-200ms per line, no API key, but no ASR correction.
-type TranslateEngine = 'haiku' | 'local'
-function getEngine(): TranslateEngine {
+// Translation engine selector.
+//   haiku            — Anthropic Haiku 4.5. ASR-error correction +
+//                      context-aware homophone recovery; needs
+//                      ANTHROPIC_API_KEY. ~1-2 s per line.
+//   local            — NLLB-200-distilled-600M on-device, no API key,
+//                      sub-second per line, no ASR correction.
+//   openai-realtime  — gpt-realtime-translate over WebSocket. Translation
+//                      text is filled in by the realtime audio session
+//                      (audio-capture.ts owns the WS), so this engine is
+//                      a no-op for the text-translation queue. Requires
+//                      MEEPCALL_TRANSCRIBE_ENGINE=openai-realtime; mixing
+//                      with local transcribe is unsupported.
+//
+// Default `haiku`. The openai-realtime path is opt-in; users who want
+// fully free + on-device should set MEEPCALL_TRANSLATE_ENGINE=local.
+export type TranslateEngine = 'haiku' | 'local' | 'openai-realtime'
+export function getTranslateEngine(): TranslateEngine {
   const raw = (process.env.MEEPCALL_TRANSLATE_ENGINE ?? 'haiku').trim().toLowerCase()
-  return raw === 'local' ? 'local' : 'haiku'
+  if (raw === 'local') return 'local'
+  if (raw === 'openai-realtime') return 'openai-realtime'
+  return 'haiku'
 }
 
 // Trigger translation when the line contains any character from a
@@ -141,7 +154,12 @@ export function queueTranslation(noteId: string, entry: TranscriptEntry): void {
   const key = `${noteId}|${entry.timestamp}|${entry.text}`
   if (succeeded.has(key) || inflight.has(key)) return
 
-  const engine = getEngine()
+  const engine = getTranslateEngine()
+  // Realtime audio-driven translation populates entry.translation from
+  // the WebSocket session in audio-capture.ts; the text-translation
+  // queue is a no-op for this engine.
+  if (engine === 'openai-realtime') return
+
   let attempt: Promise<boolean>
   if (engine === 'local') {
     // NLLB doesn't benefit from chat-style context; skip the ring-buffer
@@ -183,7 +201,7 @@ async function translateLocalAndPersist(
   return true
 }
 
-async function persistTranslation(
+export async function persistTranslation(
   noteId: string,
   entry: TranscriptEntry,
   translation: string

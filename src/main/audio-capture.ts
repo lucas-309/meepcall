@@ -13,7 +13,13 @@ import { createSileroVad, FRAME_DURATION_MS, type SileroVad } from './silero-vad
 import { createWhisperSession, type WhisperSession, type WhisperSource } from './whisper'
 import { sendToRenderer } from './window'
 import { runPostRecording } from './post-recording'
-import { queueTranslation } from './translator'
+import {
+  getTranslateEngine,
+  persistTranslation,
+  queueTranslation,
+  type TranslateEngine
+} from './translator'
+import { RealtimeSession, type RealtimeMode } from './openai-realtime'
 import {
   startCompareModeRecallRecording,
   startRecallAdHocRecording,
@@ -21,11 +27,66 @@ import {
   stopRecallRecording
 } from './recall-sdk'
 
+// Transcription engine selector. `local` (default) uses the chunker +
+// resident whisper-server pipeline. `openai-realtime` opens one
+// gpt-realtime-whisper / gpt-realtime-translate WebSocket per source
+// and bypasses the chunker — server-side VAD picks phrase boundaries.
+type TranscribeEngine = 'local' | 'openai-realtime'
+function getTranscribeEngine(): TranscribeEngine {
+  const raw = (process.env.MEEPCALL_TRANSCRIBE_ENGINE ?? 'local').trim().toLowerCase()
+  return raw === 'openai-realtime' ? 'openai-realtime' : 'local'
+}
+
+// Pick the realtime model + mode for a given (transcribe, translate)
+// engine pair. Returns null when no realtime session is needed.
+//
+// Supported combinations:
+//   transcribe=openai-realtime, translate=openai-realtime  → mode='translate'
+//     (one gpt-realtime-translate socket per source, source + target text)
+//   transcribe=openai-realtime, translate=local|haiku      → mode='transcribe'
+//     (gpt-realtime-whisper, transcription only)
+//   transcribe=local, translate=openai-realtime            → unsupported
+//     (would require timestamp-matching across two independent streams;
+//      we warn once and fall back to skipping translation)
+//   transcribe=local, translate=local|haiku                → null
+//     (full local pipeline, no realtime needed)
+let warnedMixedRealtime = false
+let warnedNoOpenAIKey = false
+function pickRealtimeMode(
+  transcribe: TranscribeEngine,
+  translate: TranslateEngine
+): RealtimeMode | null {
+  const wantsRealtime = transcribe === 'openai-realtime' || translate === 'openai-realtime'
+  if (wantsRealtime && !process.env.OPENAI_API_KEY?.trim()) {
+    if (!warnedNoOpenAIKey) {
+      warnedNoOpenAIKey = true
+      log.warn(
+        'ai',
+        'OPENAI_API_KEY is unset but MEEPCALL_TRANSCRIBE_ENGINE / MEEPCALL_TRANSLATE_ENGINE = openai-realtime — falling back to the local pipeline for this recording.'
+      )
+    }
+    return null
+  }
+  if (transcribe === 'openai-realtime' && translate === 'openai-realtime') return 'translate'
+  if (transcribe === 'openai-realtime') return 'transcribe'
+  if (translate === 'openai-realtime') {
+    if (!warnedMixedRealtime) {
+      warnedMixedRealtime = true
+      log.warn(
+        'ai',
+        'MEEPCALL_TRANSLATE_ENGINE=openai-realtime requires MEEPCALL_TRANSCRIBE_ENGINE=openai-realtime too (timestamp-matching across independent streams is not supported). Translation will be skipped this run.'
+      )
+    }
+    return null
+  }
+  return null
+}
+
 // Reversible eval flag: when on, route ALL ad-hoc recordings through the
 // Recall SDK's prepareDesktopAudioRecording flow instead of the local Swift +
 // whisper pipeline. Flip off (unset / =0) to return to local. Read on each
 // call so toggling between runs is enough — no code changes needed.
-function useRecallForAdHoc(): boolean {
+function recallForAdHocEnabled(): boolean {
   return process.env.MEEPCALL_USE_RECALL_FOR_ADHOC === '1'
 }
 
@@ -35,6 +96,13 @@ function useRecallForAdHoc(): boolean {
 // Costs Recall credits ($0.65/hr) for the duration of the recording.
 function compareModeEnabled(): boolean {
   return process.env.MEEPCALL_COMPARE_MODE === '1'
+}
+
+// Plain env var by request, intentionally not MEEPCALL_-prefixed so the
+// one-shot dev command stays short: `DISABLE_MIC=1 pnpm dev`.
+function micCaptureDisabled(): boolean {
+  const raw = process.env.DISABLE_MIC?.trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes'
 }
 
 // Fixed-window chunking. Each whisper chunk is CHUNK_SECONDS wide; the
@@ -61,7 +129,7 @@ const PHRASE_SILENCE_END_MS = 400 // 400 ms of trailing silence = phrase end
 // likely to count quiet speech as silence), lower = more permissive.
 const VAD_SPEECH_THRESHOLD = 0.5
 
-function usePhraseVad(): boolean {
+function phraseVadEnabled(): boolean {
   return process.env.MEEPCALL_PHRASE_VAD === '1'
 }
 
@@ -120,7 +188,6 @@ function rmsOfPcm(pcm: Buffer): number {
   return Math.sqrt(sumSq / samples)
 }
 
-
 interface SourceState {
   proc: ChildProcessByStdio<null, Readable, Readable>
   pending: Buffer[]
@@ -146,6 +213,16 @@ interface SourceState {
   inFlight: number
   droppedChunks: number
   recentInferMs: number[]
+  // OpenAI realtime WebSocket session, when MEEPCALL_TRANSCRIBE_ENGINE
+  // (or translate engine) is openai-realtime. Owns its own reconnect
+  // budget; survives the per-source helper close gracefully. Null when
+  // the local pipeline is used (also null on fallback when the user
+  // asked for realtime but OPENAI_API_KEY is missing).
+  realtime: RealtimeSession | null
+  // Whether the local chunker → whisper-server pipeline should consume
+  // PCM for this source. True when transcribe is local, OR when the
+  // user asked for realtime transcribe but it isn't usable (no key).
+  useLocalChunker: boolean
 }
 
 const RECENT_INFER_LEN = 5
@@ -470,8 +547,16 @@ function attachStdoutPipeline(
   handle: RecorderHandle,
   ss: SourceState
 ): void {
-  const vad = usePhraseVad()
+  const vad = phraseVadEnabled()
+  // ss.useLocalChunker captures the post-fallback decision: whether the
+  // local chunker should consume PCM for this source. Realtime owns
+  // phrase boundaries server-side, so feeding both when realtime is
+  // active would just waste CPU on transcripts we'd discard.
   ss.proc.stdout.on('data', (chunk: Buffer) => {
+    // Always forward PCM to the realtime session (when present) — it
+    // owns its own resampler, audio-time clock, and reconnect logic.
+    if (ss.realtime) ss.realtime.appendAudio16k(chunk)
+    if (!ss.useLocalChunker) return
     if (vad) {
       // Serialize through the per-source VAD queue. Silero's LSTM state must
       // be fed sequentially or it corrupts.
@@ -567,9 +652,10 @@ async function flushChunk(
   // and must not be dropped.
   if (!force && ss && ss.inFlight >= MAX_INFLIGHT_CHUNKS) {
     ss.droppedChunks++
-    const recent = ss.recentInferMs.length > 0
-      ? ` (recent inference: ${ss.recentInferMs.map((m) => `${(m / 1000).toFixed(1)}s`).join(' ')})`
-      : ''
+    const recent =
+      ss.recentInferMs.length > 0
+        ? ` (recent inference: ${ss.recentInferMs.map((m) => `${(m / 1000).toFixed(1)}s`).join(' ')})`
+        : ''
     log.warn(
       'audio',
       `${source}: queue depth ${ss.inFlight} ≥ ${MAX_INFLIGHT_CHUNKS}, dropping chunk #${chunkIndex}${recent}`
@@ -632,7 +718,7 @@ async function drainAndFlushFinal(
   handle: RecorderHandle,
   ss: SourceState
 ): Promise<void> {
-  const vad = usePhraseVad()
+  const vad = phraseVadEnabled()
   // In phrase-VAD mode, wait for any in-flight inference on the queue to
   // finish first so the chunker has fully reacted to the last bytes.
   if (vad) {
@@ -677,12 +763,14 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
     closed,
     inFlight: 0,
     droppedChunks: 0,
-    recentInferMs: []
+    recentInferMs: [],
+    realtime: null,
+    useLocalChunker: true
   }
   // Lazily create the silero VAD only when phrase-VAD mode is on. The first
   // session creation pays a ~150 ms onnxruntime warm-up; subsequent sources
   // reuse the cached InferenceSession via getSession().
-  if (usePhraseVad()) {
+  if (phraseVadEnabled()) {
     void createSileroVad()
       .then((v) => {
         ss.vad = v
@@ -691,8 +779,84 @@ function startSource(handle: RecorderHandle, source: WhisperSource): SourceState
         log.err('audio', `silero-vad init failed: ${(err as Error).message}`)
       })
   }
+
+  // Decide which path produces transcripts for this source. The realtime
+  // session, when picked AND the API key is available, replaces the local
+  // chunker entirely (server-side VAD, no need for our 2 s window). If we
+  // can't open the realtime session — no API key, picker returned null —
+  // the local chunker is the fallback so the user gets *some* output
+  // instead of silence.
+  const transcribeEngine = getTranscribeEngine()
+  const translateEngine = getTranslateEngine()
+  const rtMode = pickRealtimeMode(transcribeEngine, translateEngine)
+  // Local chunker runs when transcribe is local OR when realtime fell back.
+  ss.useLocalChunker = transcribeEngine === 'local' || rtMode === null
+  if (rtMode) {
+    ss.realtime = new RealtimeSession(rtMode, source, {
+      onTranscript: (itemId, text, sourceLang, audioOffsetMs) => {
+        const speaker = source === 'mic' ? 'You' : 'Other'
+        const entry: TranscriptEntry = {
+          text,
+          speaker,
+          timestamp: new Date(handle.startedAt + audioOffsetMs).toISOString(),
+          sourceLanguage: sourceLang ?? undefined
+        }
+        // Stash the itemId → entry-key mapping so an arriving translation
+        // (translate mode only) can find this exact entry to update.
+        rememberRealtimeItem(itemId, handle.noteId, entry)
+        fireTranscript(handle.noteId, [entry])
+      },
+      onTranslation: (itemId, text) => {
+        const ref = consumeRealtimeItem(itemId)
+        if (!ref) return
+        void persistTranslation(
+          ref.noteId,
+          {
+            text: ref.text,
+            speaker: ref.speaker,
+            timestamp: ref.timestamp
+          } as TranscriptEntry,
+          text
+        )
+        log.ai(`Translation [${ref.speaker}] (realtime): ${text}`)
+      }
+    })
+    ss.realtime.ensureOpen()
+  }
+
   attachStdoutPipeline(source, handle, ss)
   return ss
+}
+
+// Map from openai-realtime item_id → enough metadata to find the
+// persisted TranscriptEntry when the matching translation arrives.
+// Cleared when the translation is consumed; size-bounded so a missing
+// translation doesn't leak memory across long recordings.
+interface RealtimeItemRef {
+  noteId: string
+  text: string
+  speaker: string
+  timestamp: string
+}
+const realtimeItems = new Map<string, RealtimeItemRef>()
+const REALTIME_ITEMS_MAX = 256
+
+function rememberRealtimeItem(itemId: string, noteId: string, entry: TranscriptEntry): void {
+  realtimeItems.set(itemId, {
+    noteId,
+    text: entry.text,
+    speaker: entry.speaker,
+    timestamp: entry.timestamp
+  })
+  if (realtimeItems.size > REALTIME_ITEMS_MAX) {
+    const oldestKey = realtimeItems.keys().next().value
+    if (oldestKey !== undefined) realtimeItems.delete(oldestKey)
+  }
+}
+function consumeRealtimeItem(itemId: string): RealtimeItemRef | undefined {
+  const ref = realtimeItems.get(itemId)
+  if (ref) realtimeItems.delete(itemId)
+  return ref
 }
 
 async function stopSource(
@@ -717,6 +881,10 @@ async function stopSource(
     }, 3000)
   )
   await Promise.race([ss.closed, timeout])
+  if (ss.realtime) {
+    ss.realtime.close()
+    ss.realtime = null
+  }
   await drainAndFlushFinal(source, handle, ss)
   if (ss.droppedChunks > 0) {
     log.warn(
@@ -742,7 +910,11 @@ async function createRecording(
     mic: null,
     system: null
   }
-  handle.mic = startSource(handle, 'mic')
+  if (micCaptureDisabled()) {
+    log.local('DISABLE_MIC=1 — mic capture disabled; transcribing system audio only')
+  } else {
+    handle.mic = startSource(handle, 'mic')
+  }
   handle.system = startSource(handle, 'system')
   handles.set(recordingId, handle)
   log.ok('audio', `Recording STARTED: id=${recordingId.slice(0, 8)}… note=${noteId}`)
@@ -753,9 +925,16 @@ export async function startAdHocRecording(
 ): Promise<
   { success: true; meetingId: string; recordingId: string } | { success: false; error: string }
 > {
-  if (useRecallForAdHoc()) {
-    log.local('MEEPCALL_USE_RECALL_FOR_ADHOC=1 — routing ad-hoc recording through Recall SDK')
-    return startRecallAdHocRecording(label)
+  if (recallForAdHocEnabled()) {
+    if (micCaptureDisabled()) {
+      log.warn(
+        'audio',
+        'DISABLE_MIC=1 is set, so using local system-only capture instead of Recall ad-hoc recording'
+      )
+    } else {
+      log.local('MEEPCALL_USE_RECALL_FOR_ADHOC=1 — routing ad-hoc recording through Recall SDK')
+      return startRecallAdHocRecording(label)
+    }
   }
 
   const now = new Date()
@@ -792,7 +971,12 @@ export async function startAdHocRecording(
     return { success: false, error: (err as Error).message }
   }
 
-  if (compareModeEnabled()) {
+  if (compareModeEnabled() && micCaptureDisabled()) {
+    log.warn(
+      'recall',
+      'MEEPCALL_COMPARE_MODE=1 skipped because DISABLE_MIC=1 is set and Recall shadow capture may include mic audio'
+    )
+  } else if (compareModeEnabled()) {
     log.local('MEEPCALL_COMPARE_MODE=1 — starting parallel shadow Recall recording')
     void startCompareModeRecallRecording()
   }

@@ -32,11 +32,13 @@
     "@electron/fuses": "^2.1.1",
     "@huggingface/transformers": "^4.2.0",
     "@recallai/desktop-sdk": "^2.0.11",
+    "@types/ws": "^8.18.1",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "onnxruntime-node": "^1.24.3",
     "react-markdown": "^10.1.0",
-    "undici": "^8.3.0"
+    "undici": "^8.3.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "^3.0.0",
